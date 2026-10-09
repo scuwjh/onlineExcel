@@ -203,4 +203,141 @@ export async function removePermission(id: string, username: string): Promise<Pe
   return request(`/sheets/${id}/permissions/${encodeURIComponent(username)}`, { method: "DELETE" });
 }
 
+/** 删除整张表格（仅所有者）。 */
+export async function deleteSheet(id: string): Promise<{ id: string; deleted: boolean }> {
+  return request(`/sheets/${id}`, { method: "DELETE" });
+}
+
+// ------------------------------------------------------------------------- Excel
+
+export interface XlsxParseResult {
+  sheet_name: string;
+  sheet_names: string[];
+  rows: number;
+  cols: number;
+  cell_count: number;
+  format_count: number;
+  skipped_long_cells: number;
+}
+
+function toBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return window.btoa(binary);
+}
+
+/** 读取 xlsx 并列出其中的工作表（不落库），用于导入前的选择。 */
+export async function parseXlsx(id: string, file: File, sheetName?: string): Promise<XlsxParseResult> {
+  const data = toBase64(await file.arrayBuffer());
+  return request(`/sheets/${id}/xlsx/parse`, {
+    method: "POST",
+    body: JSON.stringify({ data, sheet_name: sheetName ?? null }),
+  });
+}
+
+/** 把 xlsx 的一个工作表导入为当前表格内容（整体替换）。 */
+export async function importXlsx(
+  id: string,
+  file: File,
+  sheetName?: string,
+): Promise<SheetData & { sheet_name: string; skipped_long_cells: number }> {
+  const data = toBase64(await file.arrayBuffer());
+  return request(`/sheets/${id}/xlsx/import`, {
+    method: "POST",
+    body: JSON.stringify({ data, sheet_name: sheetName ?? null }),
+  });
+}
+
+/** 导出为 .xlsx 并触发浏览器下载（保留公式与样式）。 */
+export async function exportXlsx(
+  id: string,
+  filename: string,
+  options: { frozen_rows?: number; frozen_cols?: number } = {},
+): Promise<void> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const token = getToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(`${BASE}/sheets/${id}/xlsx/export`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(options),
+  });
+  if (!res.ok) {
+    let message = `导出失败 ${res.status}`;
+    try {
+      const body = await res.json();
+      message = body?.error || message;
+    } catch {
+      /* 保持默认信息 */
+    }
+    throw makeError(message, res.status);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename.toLowerCase().endsWith(".xlsx") ? filename : `${filename}.xlsx`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+// -------------------------------------------------------------------------- 评论
+
+export interface SheetComment {
+  id: number;
+  sheet_id: string;
+  row_id: string;
+  col_id: string;
+  author_id: number | null;
+  author: string;
+  body: string;
+  mentions: string[];
+  resolved: boolean;
+  created_at: string;
+}
+
+export interface CommentsPayload {
+  comments: SheetComment[];
+  counts: Record<string, number>;
+  members: Array<{ username: string; role: Role }>;
+}
+
+export async function listComments(id: string, includeResolved = true): Promise<CommentsPayload> {
+  return request(`/sheets/${id}/comments?include_resolved=${includeResolved ? "true" : "false"}`);
+}
+
+export async function createComment(
+  id: string,
+  rowId: string,
+  colId: string,
+  body: string,
+): Promise<{ comment: SheetComment; counts: Record<string, number>; mentions: string[] }> {
+  return request(`/sheets/${id}/comments`, {
+    method: "POST",
+    body: JSON.stringify({ row_id: rowId, col_id: colId, body }),
+  });
+}
+
+export async function resolveComment(
+  id: string,
+  commentId: number,
+  resolved = true,
+): Promise<{ comment: SheetComment; counts: Record<string, number> }> {
+  return request(`/sheets/${id}/comments/${commentId}/resolve`, {
+    method: "POST",
+    body: JSON.stringify({ resolved }),
+  });
+}
+
+export async function deleteComment(
+  id: string,
+  commentId: number,
+): Promise<{ deleted: number; counts: Record<string, number> }> {
+  return request(`/sheets/${id}/comments/${commentId}`, { method: "DELETE" });
+}
+
 export type { Cells };

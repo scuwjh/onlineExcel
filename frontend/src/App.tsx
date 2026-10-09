@@ -1,16 +1,20 @@
-/** 应用外壳：登录 → 表格工作区（协同编辑 + 历史版本 + 成员权限）。 */
+/** 应用外壳：登录 → 表格工作区（协同编辑 + 历史版本 + 成员权限 + 评论 + 筛选排序 + Excel）。 */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "./api";
+import CommentsPanel from "./components/CommentsPanel";
 import FormulaBar from "./components/FormulaBar";
 import Grid from "./components/Grid";
 import { PermissionsPanel, VersionsPanel } from "./components/Panels";
 import PresenceBar from "./components/PresenceBar";
 import Toolbar from "./components/Toolbar";
+import ViewPanel from "./components/ViewPanel";
+import { useComments } from "./hooks/useComments";
 import { useSheet } from "./hooks/useSheet";
 import { cellKey } from "./lib/gridUtils";
-import type { Role, SheetData, SheetSummary } from "./types";
+import { computeRowOrder } from "./lib/viewFilter";
+import type { ColumnFilter, Role, SheetData, SheetSummary, SortRule } from "./types";
 
-type Panel = "none" | "versions" | "permissions";
+type Panel = "none" | "versions" | "permissions" | "comments" | "view";
 
 export default function App() {
   const [token, setToken] = useState<string | null>(() => api.getToken());
@@ -20,6 +24,10 @@ export default function App() {
   const [panel, setPanel] = useState<Panel>("none");
   const [toast, setToast] = useState<string | null>(null);
   const [appError, setAppError] = useState<string | null>(null);
+  // 视图状态（本地）：筛选与排序都不改数据
+  const [filters, setFilters] = useState<ColumnFilter[]>([]);
+  const [sort, setSort] = useState<SortRule | null>(null);
+  const xlsxRef = useRef<HTMLInputElement>(null);
 
   const refreshList = useCallback(async () => {
     try {
@@ -35,7 +43,28 @@ export default function App() {
     void reloadRef.current();
   }, [refreshList]);
 
-  const sheetApi = useSheet(sheet, onSheetChanged);
+  /**
+   * 评论（REQ-100）与单元格数据分开加载。
+   * 这里先用 ref 转发 WebSocket 的评论广播（回调要稳定，避免 socket 锁死旧闭包），
+   * 再把 ref 指向真实的评论 hook。
+   */
+  const commentsBridge = useRef<{
+    applyRemote: (comment: api.SheetComment, counts: Record<string, number>) => void;
+  } | null>(null);
+  const onCommentBroadcast = useCallback((comment: Record<string, unknown>, counts: Record<string, number>) => {
+    commentsBridge.current?.applyRemote(comment as unknown as api.SheetComment, counts);
+  }, []);
+
+  const sheetApi = useSheet(sheet, onSheetChanged, onCommentBroadcast);
+
+  const comments = useComments(sheetApi.state.sheetId);
+  commentsBridge.current = comments;
+
+  // 打开评论面板时刷新一次：成员列表与角标可能已被其他端的操作改变
+  useEffect(() => {
+    if (panel === "comments") void comments.reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panel]);
 
   const reloadSheet = useCallback(async () => {
     if (!sheet?.id) return;
@@ -110,6 +139,15 @@ export default function App() {
     : (sheetApi.state.cells[selectedKey] ?? "");
   const selectedFormat = sheetApi.state.formats[selectedKey] ?? {};
 
+  const mergedComments = comments;
+  const canComment = role === "owner" || role === "editor" || role === "commenter";
+
+  // 视图（REQ-101）：筛选 + 排序都只影响本端展示
+  const rowOrder = useMemo(() => {
+    if (!filters.length && !sort) return undefined;
+    return computeRowOrder(sheetApi.state.rows, sheetApi.state.cells, filters, sort);
+  }, [filters, sort, sheetApi.state.rows, sheetApi.state.cells]);
+
   const notify = useMemo(() => (message: string) => setToast(message), []);
   useEffect(() => {
     if (sheetApi.state.error) {
@@ -117,12 +155,106 @@ export default function App() {
       sheetApi.dismissError();
     }
   }, [sheetApi, notify]);
+  useEffect(() => {
+    if (comments.error) {
+      notify(comments.error);
+      comments.clearError();
+    }
+  }, [comments, notify]);
 
   useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(null), 4000);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  const selectedCellIds = useMemo(() => {
+    const { selected, rowIds, colIds } = sheetApi.state;
+    return {
+      row: selected.row,
+      col: selected.col,
+      rowId: rowIds[selected.row] ?? "",
+      colId: colIds[selected.col] ?? "",
+      ref: `${String.fromCharCode(65 + Math.min(25, selected.col))}${selected.row + 1}`,
+    };
+  }, [sheetApi.state]);
+
+  /** 在网格里定位到某个元素 ID 对应的行列（评论「定位」用）。 */
+  const jumpToCell = useCallback(
+    (rowId: string, colId: string) => {
+      const { rowIds, colIds } = sheetApi.state;
+      const row = rowIds.indexOf(rowId);
+      const col = colIds.indexOf(colId);
+      if (row >= 0 && col >= 0) sheetApi.select(row, col);
+    },
+    [sheetApi],
+  );
+
+  /** Excel 导入（REQ-050）：先解析出工作表列表，多表时让用户选择。 */
+  const importXlsx = useCallback(
+    async (file: File) => {
+      const sheetId = sheetApi.state.sheetId;
+      if (!sheetId) return;
+      try {
+        const parsed = await api.parseXlsx(sheetId, file);
+        let target = parsed.sheet_name;
+        if (parsed.sheet_names.length > 1) {
+          const answer = window.prompt(
+            `该工作簿包含 ${parsed.sheet_names.length} 个工作表，请输入要导入的名称：\n${parsed.sheet_names.join("、")}`,
+            parsed.sheet_name,
+          );
+          if (answer === null) return;
+          target = answer.trim() || parsed.sheet_name;
+        }
+        const updated = await api.importXlsx(sheetId, file, target);
+        // 导入后以服务端权威数据刷新（同时更新表格名/角色等元信息）
+        setSheet(await api.getSheet(sheetId));
+        await refreshList();
+        setFilters([]);
+        setSort(null);
+        notify(
+          `已从「${updated.sheet_name}」导入 ${updated.rows} 行 × ${updated.cols} 列` +
+            (updated.skipped_long_cells ? `，跳过 ${updated.skipped_long_cells} 个超长单元格` : ""),
+        );
+      } catch (err) {
+        notify(String((err as Error).message ?? err));
+      }
+    },
+    [notify, refreshList, sheetApi.state.sheetId],
+  );
+
+  /** Excel 导出（REQ-050）：保留公式与样式，冻结窗格一并带出。 */
+  const exportXlsx = useCallback(async () => {    const sheetId = sheetApi.state.sheetId;
+    if (!sheetId) return;
+    try {
+      await api.exportXlsx(sheetId, `${sheetApi.state.sheetName || "表格"}.xlsx`, {
+        frozen_rows: sheetApi.state.frozenRows,
+        frozen_cols: sheetApi.state.frozenCols,
+      });
+      notify("已导出 .xlsx（公式由 Excel 计算，样式与冻结窗格已保留）");
+    } catch (err) {
+      notify(String((err as Error).message ?? err));
+    }
+  }, [notify, sheetApi.state.frozenCols, sheetApi.state.frozenRows, sheetApi.state.sheetId, sheetApi.state.sheetName]);
+
+  /** 删除当前表格（仅所有者）：删完切到列表里的下一张表。 */
+  const deleteCurrentSheet = useCallback(async () => {
+    const sheetId = sheetApi.state.sheetId;
+    const name = sheetApi.state.sheetName || "该表格";
+    if (!sheetId) return;
+    if (!window.confirm(`确定删除「${name}」吗？表格内容、版本历史与评论都会一并删除，且不可恢复。`)) return;
+    try {
+      await api.deleteSheet(sheetId);
+      const rest = await api.listSheets();
+      setSheets(rest);
+      setSheet(rest.length ? await api.getSheet(rest[0].id) : null);
+      setFilters([]);
+      setSort(null);
+      notify(`已删除「${name}」`);
+    } catch (err) {
+      notify(String((err as Error).message ?? err));
+    }
+  }, [notify, sheetApi.state.sheetId, sheetApi.state.sheetName]);
 
   if (!token) {
     return (
@@ -153,14 +285,33 @@ export default function App() {
         onDeleteCol={sheetApi.deleteCol}
         onImport={sheetApi.importCsv}
         onExport={sheetApi.exportCsv}
+        onImportXlsx={() => xlsxRef.current?.click()}
+        onExportXlsx={() => void exportXlsx()}
         frozen={sheetApi.state.frozenRows > 0 || sheetApi.state.frozenCols > 0}
         onFreeze={sheetApi.freeze}
         onUnfreeze={sheetApi.unfreeze}
         onShowVersions={() => setPanel(panel === "versions" ? "none" : "versions")}
         onShowPermissions={() => setPanel(panel === "permissions" ? "none" : "permissions")}
+        onShowComments={() => setPanel(panel === "comments" ? "none" : "comments")}
+        onShowView={() => setPanel(panel === "view" ? "none" : "view")}
+        commentCount={comments.openCount}
+        viewActive={Boolean(filters.length || sort)}
+        canDeleteSheet={role === "owner" && Boolean(sheetApi.state.sheetId)}
+        onDeleteSheet={() => void deleteCurrentSheet()}
         onLogout={handleLogout}
         status={sheetApi.state.status}
         userName={userName}
+      />
+      <input
+        ref={xlsxRef}
+        type="file"
+        accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        style={{ display: "none" }}
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) void importXlsx(file);
+          e.target.value = "";
+        }}
       />
 
       <div className="sheet-bar">
@@ -210,6 +361,32 @@ export default function App() {
       {panel === "permissions" && sheetApi.state.sheetId && (
         <PermissionsPanel sheetId={sheetApi.state.sheetId} onClose={() => setPanel("none")} onError={notify} />
       )}
+      {panel === "comments" && sheetApi.state.sheetId && (
+        <CommentsPanel
+          comments={mergedComments.comments}
+          members={mergedComments.members}
+          selected={selectedCellIds}
+          canComment={canComment}
+          self={userName}
+          onAdd={mergedComments.add}
+          onResolve={mergedComments.resolve}
+          onRemove={mergedComments.remove}
+          onClose={() => setPanel("none")}
+          onJump={jumpToCell}
+        />
+      )}
+      {panel === "view" && sheetApi.state.sheetId && (
+        <ViewPanel
+          cols={sheetApi.state.cols}
+          filters={filters}
+          sort={sort}
+          visibleRows={rowOrder ? rowOrder.length : sheetApi.state.rows}
+          totalRows={sheetApi.state.rows}
+          onSort={setSort}
+          onFilters={setFilters}
+          onClose={() => setPanel("none")}
+        />
+      )}
 
       {sheetApi.state.loading && <div className="loading">加载中…</div>}
       {!sheetApi.state.loading && sheetApi.state.sheetId && (
@@ -235,6 +412,14 @@ export default function App() {
           onPaste={sheetApi.pasteBlock}
           onUndo={sheetApi.undo}
           onRedo={sheetApi.redo}
+          rowOrder={rowOrder}
+          commentCounts={mergedComments.counts}
+          rowIds={sheetApi.state.rowIds}
+          colIds={sheetApi.state.colIds}
+          onOpenComments={(row, col) => {
+            sheetApi.select(row, col);
+            setPanel("comments");
+          }}
         />
       )}
       {!sheetApi.state.loading && !sheetApi.state.sheetId && (

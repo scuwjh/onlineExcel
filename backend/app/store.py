@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -18,6 +19,10 @@ from typing import Iterable, Optional
 
 from . import config, crdt
 from .db import get_conn, write_lock
+
+#: @提及的词法：``@`` 后接字母/数字/下划线/连字符/点，或一段中日韩文字。
+#: 中文之间没有空格，用"遇到下一个 @ 或空白即止"的方式切分更贴近使用习惯。
+MENTION_PATTERN = re.compile(r"@([A-Za-z0-9_.\-]{1,64}|[^\s@]{1,64})")
 
 # --------------------------------------------------------------------------- 时间
 
@@ -636,3 +641,139 @@ def sheet_payload(conn, sheet_id: str, role: Optional[str] = None) -> dict:
         "colIds": state.col_ids,
         "role": role,
     }
+
+
+# --------------------------------------------------------------------------- 评论
+
+
+def parse_mentions(body: str, known_users: Optional[Iterable[str]] = None) -> list:
+    """从评论正文解析 ``@用户名``。
+
+    传 ``known_users`` 时只保留确实存在的用户名（避免把邮箱、@某人 的笔误算成提醒）。
+    返回去重后的用户名列表，保持出现顺序。
+    """
+    found: list = []
+    known = set(known_users) if known_users is not None else None
+    for match in MENTION_PATTERN.finditer(body or ""):
+        name = match.group(1)
+        if known is not None and name not in known:
+            continue
+        if name and name not in found:
+            found.append(name)
+    return found
+
+
+def add_comment(
+    conn,
+    sheet_id: str,
+    row_id: str,
+    col_id: str,
+    body: str,
+    author_id: Optional[int],
+    author: str,
+    mentions: Optional[list] = None,
+) -> dict:
+    mentions_json = json.dumps(mentions or [], ensure_ascii=False)
+    cur = conn.execute(
+        """
+        INSERT INTO comments (sheet_id, row_id, col_id, author_id, author, body, mentions, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (sheet_id, row_id, col_id, author_id, author, body, mentions_json, now_iso()),
+    )
+    return get_comment(conn, int(cur.lastrowid)) or {}
+
+
+def get_comment(conn, comment_id: int) -> Optional[dict]:
+    row = conn.execute("SELECT * FROM comments WHERE id = ?", (comment_id,)).fetchone()
+    return _comment_row(row) if row else None
+
+
+def _comment_row(row) -> dict:
+    try:
+        mentions = json.loads(row["mentions"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        mentions = []
+    return {
+        "id": int(row["id"]),
+        "sheet_id": row["sheet_id"],
+        "row_id": row["row_id"],
+        "col_id": row["col_id"],
+        "author_id": row["author_id"],
+        "author": row["author"],
+        "body": row["body"],
+        "mentions": mentions,
+        "resolved": bool(row["resolved"]),
+        "created_at": row["created_at"],
+    }
+
+
+def list_comments(conn, sheet_id: str, include_resolved: bool = True, limit: int = 500) -> list:
+    sql = "SELECT * FROM comments WHERE sheet_id = ?"
+    if not include_resolved:
+        sql += " AND resolved = 0"
+    sql += " ORDER BY id LIMIT ?"
+    return [_comment_row(r) for r in conn.execute(sql, (sheet_id, limit))]
+
+
+def resolve_comment(conn, sheet_id: str, comment_id: int, resolved: bool = True) -> Optional[dict]:
+    conn.execute(
+        "UPDATE comments SET resolved = ? WHERE id = ? AND sheet_id = ?",
+        (1 if resolved else 0, comment_id, sheet_id),
+    )
+    return get_comment(conn, comment_id)
+
+
+def delete_comment(conn, sheet_id: str, comment_id: int) -> Optional[dict]:
+    row = get_comment(conn, comment_id)
+    if not row or row["sheet_id"] != sheet_id:
+        return None
+    conn.execute("DELETE FROM comments WHERE id = ? AND sheet_id = ?", (comment_id, sheet_id))
+    return row
+
+
+def comment_counts(conn, sheet_id: str) -> dict:
+    """每个单元格的未解决评论数（供前端画角标）。键为 ``row_id:col_id``。"""
+    rows = conn.execute(
+        """
+        SELECT row_id, col_id, COUNT(*) AS n FROM comments
+        WHERE sheet_id = ? AND resolved = 0
+        GROUP BY row_id, col_id
+        """,
+        (sheet_id,),
+    ).fetchall()
+    return {f"{r['row_id']}:{r['col_id']}": int(r["n"]) for r in rows}
+
+
+def sheet_members(conn, sheet_id: str) -> list:
+    """可被 @提及 的成员（viewer 及以上，按用户名排序）。"""
+    rows = conn.execute(
+        """
+        SELECT DISTINCT u.username, p.role FROM permissions p
+        JOIN users u ON u.id = p.user_id
+        WHERE p.sheet_id = ?
+        ORDER BY u.username
+        """,
+        (sheet_id,),
+    ).fetchall()
+    return [
+        {"username": r["username"], "role": r["role"]}
+        for r in rows
+        if config.ROLE_LEVEL.get(r["role"], 0) >= config.ROLE_LEVEL["viewer"]
+    ]
+
+
+#: 与表格相关的所有表（删除表格时逐一清理，避免留下孤儿数据）。
+_SHEET_TABLES = ("permissions", "cells", "structure", "versions", "ops", "comments")
+
+
+def delete_sheet(conn, sheet_id: str) -> bool:
+    """删除表格及其全部派生数据（仅所有者可操作，路由层负责鉴权）。"""
+    row = conn.execute("SELECT id FROM sheets WHERE id = ?", (sheet_id,)).fetchone()
+    if not row:
+        return False
+    for table in _SHEET_TABLES:
+        conn.execute(f"DELETE FROM {table} WHERE sheet_id = ?", (sheet_id,))
+    conn.execute("DELETE FROM sheets WHERE id = ?", (sheet_id,))
+    crdt.invalidate_structure_cache(sheet_id)
+    return True

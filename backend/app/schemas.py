@@ -71,10 +71,29 @@ class PermissionRequest(BaseModel):
 
 
 class CommentCreate(BaseModel):
-    row: int
-    col: int
-    text: str = Field(min_length=1, max_length=2000)
-    mentions: list = Field(default_factory=list)
+    """新建评论：定位用稳定元素 ID（``row_id``/``col_id``），也兼容索引。"""
+
+    body: str = Field(min_length=1, max_length=2000)
+    row_id: Optional[str] = None
+    col_id: Optional[str] = None
+    row: Optional[int] = None
+    col: Optional[int] = None
+
+
+class CommentResolve(BaseModel):
+    resolved: bool = True
+
+
+class XlsxImportRequest(BaseModel):
+    """xlsx 内容以 base64 传输（避免额外依赖 multipart）。"""
+
+    data: str = Field(min_length=1)
+    sheet_name: Optional[str] = None
+
+
+class XlsxExportRequest(BaseModel):
+    frozen_rows: int = 0
+    frozen_cols: int = 0
 
 
 JsonValue = Union[str, int, float, bool, None, dict, list, Any]

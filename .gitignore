@@ -6,5 +6,5 @@ __pycache__/
 backend/data.db
 .DS_Store
 
-# ¶Ëµ½¶ËÑéÖ¤½Å±¾Êä³öµÄ½ØÍ¼£¨scripts/verify-ui.py£©
-scripts/shot-*.png
+# ç«¯åˆ°ç«¯éªŒè¯è„šæœ¬è¾“å‡ºçš„æˆªå›¾ï¼ˆç”± scripts/verify-ui.py ç”Ÿæˆï¼‰
+scripts/artifacts/

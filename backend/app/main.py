@@ -102,6 +102,8 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 def _startup() -> None:
     info = bootstrap.bootstrap()
     app.state.bootstrap_info = info
+    # 同步端点（评论等）需要跨线程把广播投递到主事件循环
+    routes.remember_event_loop()
     if info.get("generated_admin_password"):
         logger.warning(
             "初始管理员 %s 已创建，口令：%s（请设置 OE_ADMIN_PASSWORD 固定口令）",

@@ -95,6 +95,52 @@ export interface PermissionEntry {
   username: string | null;
 }
 
+/** 筛选运算符（REQ-101）。 */
+export type FilterOp =
+  | "contains"
+  | "notContains"
+  | "equals"
+  | "notEquals"
+  | "empty"
+  | "notEmpty"
+  | "gt"
+  | "gte"
+  | "lt"
+  | "lte";
+
+export interface ColumnFilter {
+  col: number;
+  op: FilterOp;
+  value?: string;
+}
+
+export interface SortRule {
+  col: number;
+  dir: "asc" | "desc";
+}
+
+/** 视图状态：筛选与排序都只影响本端展示，不改动存储的数据顺序。 */
+export interface ViewState {
+  filters: ColumnFilter[];
+  sort: SortRule | null;
+}
+
+export const FILTER_LABELS: Record<FilterOp, string> = {
+  contains: "包含",
+  notContains: "不包含",
+  equals: "等于",
+  notEquals: "不等于",
+  empty: "为空",
+  notEmpty: "不为空",
+  gt: "大于",
+  gte: "大于等于",
+  lt: "小于",
+  lte: "小于等于",
+};
+
+export const FILTERS_WITHOUT_VALUE: FilterOp[] = ["empty", "notEmpty"];
+
+
 export const DEFAULT_ROWS = 100;
 export const DEFAULT_COLS = 20;
 

@@ -31,6 +31,10 @@ MAX_ROWS = int(os.environ.get("OE_MAX_ROWS", "100000"))
 MAX_COLS = int(os.environ.get("OE_MAX_COLS", "500"))
 #: 单元格文本长度上限。
 MAX_CELL_CHARS = int(os.environ.get("OE_MAX_CELL_CHARS", "32767"))
+#: Excel 导入文件大小上限（字节，默认 10MB）。
+MAX_XLSX_BYTES = int(os.environ.get("OE_MAX_XLSX_BYTES", str(10 * 1024 * 1024)))
+#: 单条评论长度上限。
+MAX_COMMENT_CHARS = int(os.environ.get("OE_MAX_COMMENT_CHARS", "2000"))
 #: 单个 WebSocket 消息的体积上限（字符数）。超过则只发送必要元数据，
 #: 由客户端改用 REST 拉取权威状态（大表格的 welcome/结构变更会命中该上限）。
 MAX_WS_MESSAGE_CHARS = int(os.environ.get("OE_MAX_WS_MESSAGE", "900000"))

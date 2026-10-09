@@ -36,6 +36,17 @@ interface Props {
   onPaste: (row: number, col: number, text: string) => void;
   onUndo: () => void;
   onRedo: () => void;
+  /**
+   * 展示行序（REQ-101）：数组下标是"视图位置"，值是真实数据行号。
+   * 筛选/排序只影响这里，数据本身与存储顺序不变。
+   */
+  rowOrder?: number[];
+  /** 单元格评论数（键为 ``row_id:col_id``），用于画角标。 */
+  commentCounts?: Record<string, number>;
+  /** 行列的稳定元素 ID（评论角标按元素 ID 定位）。 */
+  rowIds?: string[];
+  colIds?: string[];
+  onOpenComments?: (row: number, col: number) => void;
 }
 
 interface ViewWindow {
@@ -80,6 +91,11 @@ export default function Grid(props: Props) {
   });
   const [size, setSize] = useState({ width: 900, height: 500 });
 
+  /** 展示行序：默认 0..rows-1；筛选/排序后由父组件传入重排结果。 */
+  const order = props.rowOrder && props.rowOrder.length !== rows ? props.rowOrder : props.rowOrder;
+  const viewHeight = order ? order.length : rows;
+  const rowAt = useCallback((slot: number) => (order ? order[slot] : slot), [order]);
+
   const measure = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -94,7 +110,7 @@ export default function Grid(props: Props) {
       const usableHeight = Math.max(ROW_H, height - HEADER_H - frozenRows * ROW_H);
       const usableWidth = Math.max(COL_W, width - ROW_HEAD_W - frozenCols * COL_W);
       const rowStart = Math.max(frozenRows, Math.floor(scrollTop / ROW_H) - OVERSCAN_ROWS);
-      const rowEnd = Math.min(rows, rowStart + Math.ceil(usableHeight / ROW_H) + OVERSCAN_ROWS * 2);
+      const rowEnd = Math.min(viewHeight, rowStart + Math.ceil(usableHeight / ROW_H) + OVERSCAN_ROWS * 2);
       const colStart = Math.max(frozenCols, Math.floor(scrollLeft / COL_W) - OVERSCAN_COLS);
       const colEnd = Math.min(cols, colStart + Math.ceil(usableWidth / COL_W) + OVERSCAN_COLS * 2);
       if (
@@ -109,7 +125,7 @@ export default function Grid(props: Props) {
       }
       return { rowStart, rowEnd, colStart, colEnd, scrollTop, scrollLeft };
     });
-  }, [rows, cols, frozenRows, frozenCols]);
+  }, [viewHeight, cols, frozenRows, frozenCols]);
 
   useLayoutEffect(() => {
     measure();
@@ -164,23 +180,27 @@ export default function Grid(props: Props) {
     return out;
   }, [view.colStart, view.colEnd]);
 
-  const scrollIntoView = useCallback((row: number, col: number) => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const rowTop = row * ROW_H;
-    const rowBottom = rowTop + ROW_H;
-    const viewTop = el.scrollTop;
-    const viewBottom = viewTop + el.clientHeight - HEADER_H;
-    if (rowBottom > viewBottom) el.scrollTop = rowBottom - el.clientHeight + HEADER_H;
-    else if (rowTop < viewTop) el.scrollTop = rowTop;
+  const scrollIntoView = useCallback(
+    (row: number, col: number) => {
+      const el = scrollRef.current;
+      if (!el) return;
+      const slot = order ? order.indexOf(row) : row; // 过滤/排序后行号不等于显示位置
+      const rowTop = (slot < 0 ? 0 : slot) * ROW_H;
+      const rowBottom = rowTop + ROW_H;
+      const viewTop = el.scrollTop;
+      const viewBottom = viewTop + el.clientHeight - HEADER_H;
+      if (rowBottom > viewBottom) el.scrollTop = rowBottom - el.clientHeight + HEADER_H;
+      else if (rowTop < viewTop) el.scrollTop = rowTop;
 
-    const colLeft = col * COL_W;
-    const colRight = colLeft + COL_W;
-    const viewLeft = el.scrollLeft;
-    const viewRight = viewLeft + el.clientWidth - ROW_HEAD_W;
-    if (colRight > viewRight) el.scrollLeft = colRight - el.clientWidth + ROW_HEAD_W;
-    else if (colLeft < viewLeft) el.scrollLeft = colLeft;
-  }, []);
+      const colLeft = col * COL_W;
+      const colRight = colLeft + COL_W;
+      const viewLeft = el.scrollLeft;
+      const viewRight = viewLeft + el.clientWidth - ROW_HEAD_W;
+      if (colRight > viewRight) el.scrollLeft = colRight - el.clientWidth + ROW_HEAD_W;
+      else if (colLeft < viewLeft) el.scrollLeft = colLeft;
+    },
+    [order],
+  );
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -216,12 +236,19 @@ export default function Grid(props: Props) {
       let nr = row;
       let nc = col;
       const pageRows = Math.max(1, Math.floor((size.height - HEADER_H) / ROW_H) - 1);
+      /** 上下移动按"展示顺序"走：被筛选隐藏的行会自动跳过。 */
+      const step = (delta: number) => {
+        if (!order) return Math.min(rows - 1, Math.max(0, row + delta));
+        const slot = order.indexOf(row);
+        const next = Math.min(order.length - 1, Math.max(0, (slot < 0 ? 0 : slot) + delta));
+        return order[next] ?? row;
+      };
       switch (e.key) {
         case "ArrowUp":
-          nr = Math.max(0, row - 1);
+          nr = step(-1);
           break;
         case "ArrowDown":
-          nr = Math.min(rows - 1, row + 1);
+          nr = step(1);
           break;
         case "ArrowLeft":
           nc = Math.max(0, col - 1);
@@ -230,10 +257,10 @@ export default function Grid(props: Props) {
           nc = Math.min(cols - 1, col + 1);
           break;
         case "PageDown":
-          nr = Math.min(rows - 1, row + pageRows);
+          nr = step(pageRows);
           break;
         case "PageUp":
-          nr = Math.max(0, row - pageRows);
+          nr = step(-pageRows);
           break;
         case "Home":
           nc = 0;
@@ -415,6 +442,9 @@ export default function Grid(props: Props) {
         const remote = Object.values(cursors).some(
           (cur) => cur.user !== self && cur.row === r && cur.col === c,
         );
+        // 评论角标：数量取自稳定元素 ID（row_id:col_id），行列插删后依然跟随
+        const commentKey = `${rowIdsForComments[r] ?? ""}:${colIdsForComments[c] ?? ""}`;
+        const commentCount = props.commentCounts?.[commentKey] ?? 0;
         return (
           <GridCell
             key={key}
@@ -425,6 +455,7 @@ export default function Grid(props: Props) {
             className={`cell${c < frozenCols ? " frozen" : ""}${isSelected ? " selected" : ""}`}
             remote={remote}
             cells={cells}
+            commentCount={commentCount}
           />
         );
       })}
@@ -441,6 +472,16 @@ export default function Grid(props: Props) {
   const frozenRowList = useMemo(
     () => Array.from({ length: Math.min(frozenRows, rows) }, (_, r) => r),
     [frozenRows, rows],
+  );
+  const rowIdsForComments = props.rowIds ?? [];
+  const colIdsForComments = props.colIds ?? [];
+  const orderIndexOf = useCallback(
+    (row: number) => {
+      if (!order) return row;
+      const idx = order.indexOf(row);
+      return idx < 0 ? row : idx;
+    },
+    [order],
   );
   const scrolledRowList = visibleRows.filter((r) => r >= frozenRows);
 
@@ -466,6 +507,7 @@ export default function Grid(props: Props) {
       // 便于自动化测试断言当前虚拟窗口（不影响渲染）
       data-view={`${view.rowStart}-${view.rowEnd}:${view.colStart}-${view.colEnd}:${Math.round(view.scrollTop)}:${Math.round(view.scrollLeft)}`}
       data-rows={visibleRows.length}
+      data-order={order ? order.slice(0, 12).join(",") : "none"}
     >
       <div className="grid-scroll" ref={scrollRef} onScroll={measure}>
         <div className="grid-space" style={{ width: ROW_HEAD_W + bodyWidth, height: HEADER_H + bodyHeight }}>
@@ -491,17 +533,20 @@ export default function Grid(props: Props) {
             className="grid-body"
             style={{ top: HEADER_H, height: bodyHeight, width: ROW_HEAD_W + bodyWidth }}
           >
-            {scrolledRowList.map((r) => (
-              <div
-                key={r}
-                className="grid-row"
-                style={{ top: r * ROW_H, height: ROW_H, width: ROW_HEAD_W + bodyWidth }}
-              >
-                <div className="grid-spacer" style={{ width: ROW_HEAD_W + frozenCols * COL_W }} />
-                {renderCells(r, scrolledCols, leftPad)}
-                {rightPad > 0 && <div className="grid-spacer" style={{ width: rightPad }} />}
-              </div>
-            ))}
+            {visibleRows.map((slot) => {
+              const r = rowAt(slot);
+              return (
+                <div
+                  key={r}
+                  className="grid-row"
+                  style={{ top: slot * ROW_H, height: ROW_H, width: ROW_HEAD_W + bodyWidth }}
+                >
+                  <div className="grid-spacer" style={{ width: ROW_HEAD_W + frozenCols * COL_W }} />
+                  {renderCells(r, scrolledCols, leftPad)}
+                  {rightPad > 0 && <div className="grid-spacer" style={{ width: rightPad }} />}
+                </div>
+              );
+            })}
           </div>
 
           {/* 左侧冻结列层：钉在视口左侧，覆盖表头 + 表体（行内容随纵向滚动裁切） */}
@@ -527,12 +572,12 @@ export default function Grid(props: Props) {
                   </div>
                 ))}
               </div>
-              {scrolledRowList.map((r) => (
+              {frozenRowList.map((r) => (
                 <div
                   key={r}
                   className="grid-row"
                   style={{
-                    top: HEADER_H + r * ROW_H - view.scrollTop,
+                    top: HEADER_H + orderIndexOf(r) * ROW_H - view.scrollTop,
                     height: ROW_H,
                     width: frozenColsW,
                   }}
@@ -602,7 +647,9 @@ export default function Grid(props: Props) {
           {selected.row + 1}
         </span>
         <span className="muted">
-          共 {rows.toLocaleString("en-US")} 行 × {cols} 列 · 已渲染 {visibleRows.length}×{visibleCols.length}
+          共 {rows.toLocaleString("en-US")} 行 × {cols} 列
+          {order ? ` · 显示 ${order.length.toLocaleString("en-US")} 行（筛选/排序生效）` : ""}
+          {" · "}已渲染 {visibleRows.length}×{visibleCols.length}
           {frozenRows || frozenCols ? ` · 冻结 ${frozenRows} 行 / ${frozenCols} 列` : ""}
         </span>
       </div>
@@ -619,20 +666,26 @@ interface CellProps {
   className: string;
   remote: boolean;
   cells: Cells;
+  commentCount?: number;
 }
 
 function GridCell(props: CellProps) {
-  const { row, col, value, style, className, remote } = props;
+  const { row, col, value, style, className, remote, commentCount = 0 } = props;
+  const title = [remote ? "其他用户正在此处" : "", commentCount ? `${commentCount} 条评论` : ""]
+    .filter(Boolean)
+    .join(" · ");
   return (
     <div
       data-cell="1"
       data-row={row}
       data-col={col}
+      data-comments={commentCount || undefined}
       style={style}
-      className={`${className}${remote ? " remote" : ""}`}
-      title={remote ? "其他用户正在此处" : undefined}
+      className={`${className}${remote ? " remote" : ""}${commentCount ? " has-comment" : ""}`}
+      title={title || undefined}
     >
       <span>{evaluate(value, props.cells)}</span>
+      {commentCount > 0 && <i className="comment-badge" aria-label={`${commentCount} 条评论`} />}
     </div>
   );
 }

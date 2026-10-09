@@ -1,19 +1,26 @@
-"""REST 路由：鉴权、表格 CRUD、单元格/格式/行列操作、版本（列表/diff/恢复/回退）、权限管理。
+"""REST 路由：鉴权、表格 CRUD、单元格/格式/行列操作、版本（列表/diff/恢复/回退）、
+权限管理、Excel 导入导出、评论与 @提醒。
 
 所有写操作都经过统一的 :func:`_apply` 入口 → ``store.apply_ops``，因此
 REST 与 WebSocket 产生完全相同的操作日志与版本语义。
 """
 from __future__ import annotations
 
+import asyncio
+import base64
+import binascii
 import json
 from typing import Optional
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
-from . import auth, config, crdt, store
+from . import auth, config, crdt, store, xlsx
 from .db import get_conn, write_lock
 from .schemas import (
     CellsUpdateRequest,
+    CommentCreate,
+    CommentResolve,
     ImportRequest,
     LoginRequest,
     OperationRequest,
@@ -21,6 +28,8 @@ from .schemas import (
     RowColRequest,
     SheetCreate,
     SheetRename,
+    XlsxExportRequest,
+    XlsxImportRequest,
 )
 
 router = APIRouter(prefix="/api")
@@ -132,6 +141,19 @@ def rename_sheet(sheet_id: str, body: SheetRename, user: dict = Depends(current_
         store.rename_sheet(conn, sheet_id, body.name)
         conn.commit()
     return {"ok": True, "data": {"id": sheet_id, "name": body.name}}
+
+
+@router.delete("/sheets/{sheet_id}")
+def delete_sheet(sheet_id: str, user: dict = Depends(current_user)):
+    """删除表格（仅所有者）：连带清理权限、单元格、结构、版本、操作日志与评论。"""
+    sheet_access(sheet_id, user, "owner")
+    conn = get_conn()
+    with write_lock:
+        removed = store.delete_sheet(conn, sheet_id)
+        conn.commit()
+    if not removed:
+        raise HTTPException(status_code=404, detail="表格不存在")
+    return {"ok": True, "data": {"id": sheet_id, "deleted": True}}
 
 
 @router.get("/sheets/{sheet_id}/access")
@@ -443,3 +465,229 @@ def delete_permission(sheet_id: str, username: str, user: dict = Depends(current
         conn.commit()
         data = store.list_permissions(conn, sheet_id)
     return {"ok": True, "data": data}
+
+
+# --------------------------------------------------------------------------- Excel
+
+
+def _decode_xlsx(body: XlsxImportRequest) -> bytes:
+    try:
+        data = base64.b64decode(body.data, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Excel 内容不是合法的 base64") from exc
+    if not data:
+        raise HTTPException(status_code=400, detail="Excel 内容为空")
+    if len(data) > config.MAX_XLSX_BYTES:
+        raise HTTPException(
+            status_code=400, detail=f"Excel 文件过大（上限 {config.MAX_XLSX_BYTES // (1024 * 1024)}MB）"
+        )
+    return data
+
+
+@router.post("/sheets/{sheet_id}/xlsx/parse")
+def xlsx_parse(sheet_id: str, body: XlsxImportRequest, user: dict = Depends(current_user)):
+    """解析上传的 xlsx，返回列出的工作表名与预览统计（不落库）。"""
+    _apply(sheet_id, [], user)
+    data = _decode_xlsx(body)
+    try:
+        result = xlsx.import_workbook(data, body.sheet_name)
+    except xlsx.ExcelError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "data": {
+            "sheet_name": result["sheet_name"],
+            "sheet_names": result["sheet_names"],
+            "rows": result["rows"],
+            "cols": result["cols"],
+            "cell_count": len(result["cells"]),
+            "format_count": len(result["formats"]),
+            "skipped_long_cells": result["skipped_long_cells"],
+        },
+    }
+
+
+@router.post("/sheets/{sheet_id}/xlsx/import")
+def xlsx_import(sheet_id: str, body: XlsxImportRequest, user: dict = Depends(current_user)):
+    """把 xlsx 的一个工作表导入为当前表格内容（整体替换，生成一个版本）。"""
+    _apply(sheet_id, [], user)
+    data = _decode_xlsx(body)
+    try:
+        parsed = xlsx.import_workbook(data, body.sheet_name)
+    except xlsx.ExcelError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        result = store.replace_sheet(
+            sheet_id,
+            parsed["rows"],
+            parsed["cols"],
+            parsed["cells"],
+            user["username"],
+            client_id=f"xlsx:{user['username']}",
+            formats=parsed["formats"],
+        )
+    except crdt.InvalidOperation as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # 响应补上表格名与角色：前端会直接用这个对象刷新状态（缺 name 会导致标题显示异常）
+    result["name"] = (store.sheet_meta(get_conn(), sheet_id) or {}).get("name", "")
+    result["role"] = sheet_access(sheet_id, user, "viewer")
+    result["sheet_name"] = parsed["sheet_name"]
+    result["skipped_long_cells"] = parsed["skipped_long_cells"]
+    return {"ok": True, "data": result}
+
+
+@router.post("/sheets/{sheet_id}/xlsx/export")
+def xlsx_export(sheet_id: str, body: Optional[XlsxExportRequest] = None, user: dict = Depends(current_user)):
+    """导出为 .xlsx（保留公式、样式、冻结窗格）。"""
+    sheet_access(sheet_id, user, "viewer")
+    conn = get_conn()
+    payload = store.sheet_payload(conn, sheet_id)
+    options = body or XlsxExportRequest()
+    try:
+        data = xlsx.export_workbook(
+            payload["name"],
+            payload["rows"],
+            payload["cols"],
+            payload["cells"],
+            payload["formats"],
+            frozen_rows=int(options.frozen_rows or 0),
+            frozen_cols=int(options.frozen_cols or 0),
+        )
+    except xlsx.ExcelError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    filename = _safe_filename(payload["name"]) + ".xlsx"
+    # HTTP 头只能承载 ASCII：中文文件名必须用 RFC 5987 的百分号编码放进 filename*
+    quoted = quote(filename)
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename=\"sheet.xlsx\"; filename*=UTF-8''{quoted}",
+            "X-Filename": quoted,
+        },
+    )
+
+
+def _safe_filename(name: str) -> str:
+    cleaned = "".join(ch for ch in (name or "sheet") if ch not in '\\/:*?"<>|').strip()
+    return (cleaned or "sheet")[:60]
+
+
+# --------------------------------------------------------------------------- 评论
+
+
+@router.get("/sheets/{sheet_id}/comments")
+def list_comments(
+    sheet_id: str,
+    include_resolved: bool = True,
+    user: dict = Depends(current_user),
+):
+    sheet_access(sheet_id, user, "viewer")
+    conn = get_conn()
+    return {
+        "ok": True,
+        "data": {
+            "comments": store.list_comments(conn, sheet_id, include_resolved=include_resolved),
+            "counts": store.comment_counts(conn, sheet_id),
+            "members": store.sheet_members(conn, sheet_id),
+        },
+    }
+
+
+@router.post("/sheets/{sheet_id}/comments")
+def create_comment(sheet_id: str, body: CommentCreate, user: dict = Depends(current_user)):
+    # 评论者及以上可写评论；viewer 只能读
+    sheet_access(sheet_id, user, "commenter")
+    conn = get_conn()
+    if len(body.body) > config.MAX_COMMENT_CHARS:
+        raise HTTPException(status_code=400, detail="评论内容超长")
+    state = crdt.load_state(conn, sheet_id)
+    row_id = body.row_id
+    col_id = body.col_id
+    if row_id is None or col_id is None:
+        raise HTTPException(status_code=400, detail="缺少 row_id / col_id")
+    if row_id not in state.row_ids or col_id not in state.col_ids:
+        raise HTTPException(status_code=400, detail="该单元格已不存在（行或列已被删除）")
+    members = [m["username"] for m in store.sheet_members(conn, sheet_id)]
+    mentions = store.parse_mentions(body.body, members)
+    with write_lock:
+        comment = store.add_comment(
+            conn, sheet_id, row_id, col_id, body.body, user["id"], user["username"], mentions
+        )
+        conn.commit()
+        counts = store.comment_counts(conn, sheet_id)
+    # 广播给同表格的其他客户端（与 WebSocket 上行写入保持一致的行为）
+    _broadcast_from_sync(
+        sheet_id,
+        {"type": "comment_added", "comment": comment, "counts": counts, "mentions": mentions},
+    )
+    return {"ok": True, "data": {"comment": comment, "counts": counts, "mentions": mentions}}
+
+
+def _broadcast_from_sync(sheet_id: str, message: dict) -> None:
+    """在同步 REST 处理函数里把消息投递到 WebSocket 房间。
+
+    同步端点由 FastAPI 放在线程池里执行，线程内没有运行中的事件循环，
+    因此用启动时保存的主循环 + ``run_coroutine_threadsafe`` 投递。
+    拿不到主循环时（例如 pytest 的同步 TestClient）静默跳过：
+    广播是增强行为，不应让写入失败。
+    """
+    loop = _main_loop
+    if loop is None or loop.is_closed():
+        return
+    from . import ws as ws_module
+
+    try:
+        asyncio.run_coroutine_threadsafe(ws_module.manager.broadcast(sheet_id, message), loop)
+    except RuntimeError:
+        return
+
+
+#: 应用启动时保存的主事件循环（供同步端点跨线程投递广播）。
+_main_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def remember_event_loop() -> None:
+    """在 FastAPI startup 里调用，记录主循环。"""
+    global _main_loop
+    try:
+        _main_loop = asyncio.get_running_loop()
+    except RuntimeError:  # pragma: no cover - 正常启动时不会发生
+        _main_loop = None
+
+
+@router.post("/sheets/{sheet_id}/comments/{comment_id}/resolve")
+def resolve_comment(
+    sheet_id: str,
+    comment_id: int,
+    body: Optional[CommentResolve] = None,
+    user: dict = Depends(current_user),
+):
+    sheet_access(sheet_id, user, "commenter")
+    resolved = True if body is None else bool(body.resolved)
+    conn = get_conn()
+    with write_lock:
+        comment = store.resolve_comment(conn, sheet_id, comment_id, resolved)
+        if not comment:
+            raise HTTPException(status_code=404, detail="评论不存在")
+        conn.commit()
+        counts = store.comment_counts(conn, sheet_id)
+    _broadcast_from_sync(sheet_id, {"type": "comment_updated", "comment": comment, "counts": counts})
+    return {"ok": True, "data": {"comment": comment, "counts": counts}}
+
+
+@router.delete("/sheets/{sheet_id}/comments/{comment_id}")
+def delete_comment(sheet_id: str, comment_id: int, user: dict = Depends(current_user)):
+    role = sheet_access(sheet_id, user, "commenter")
+    conn = get_conn()
+    existing = store.get_comment(conn, comment_id)
+    if not existing or existing["sheet_id"] != sheet_id:
+        raise HTTPException(status_code=404, detail="评论不存在")
+    # 只能删自己的评论；owner/editor 可删任意评论
+    if existing["author"] != user["username"] and auth.role_level(role) < config.ROLE_LEVEL["editor"]:
+        raise HTTPException(status_code=403, detail="只能删除自己的评论")
+    with write_lock:
+        removed = store.delete_comment(conn, sheet_id, comment_id)
+        conn.commit()
+        counts = store.comment_counts(conn, sheet_id)
+    return {"ok": True, "data": {"deleted": (removed or {}).get("id"), "counts": counts}}

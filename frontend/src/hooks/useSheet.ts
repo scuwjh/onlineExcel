@@ -298,11 +298,18 @@ export interface UseSheetResult {
   dismissError: () => void;
 }
 
-export function useSheet(sheet: SheetData | null, onSheetChanged?: () => void): UseSheetResult {
+export function useSheet(
+  sheet: SheetData | null,
+  onSheetChanged?: () => void,
+  onCommentAdded?: (comment: Record<string, unknown>, counts: Record<string, number>) => void,
+): UseSheetResult {
   const [state, dispatch] = useReducer(reducer, initialState);
   const wsRef = useRef<WsClient | null>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
+  /** 评论广播回调：用 ref 持有，避免 socket 回调锁死旧闭包。 */
+  const onCommentAddedRef = useRef(onCommentAdded);
+  onCommentAddedRef.current = onCommentAdded;
   const versionRef = useRef<Record<string, number>>({});
   const counterRef = useRef(0);
   /** 本端最近一次乐观写入，用于识别服务端回执（回执不带 client_id）。 */
@@ -315,21 +322,23 @@ export function useSheet(sheet: SheetData | null, onSheetChanged?: () => void): 
   const dismissError = useCallback(() => dispatch({ type: "ERROR", error: null }), []);
   const clearHistory = useCallback(() => dispatch({ type: "CLEAR_HISTORY" }), []);
 
-  const loadedSheetRef = useRef<string | null>(null);
+  const loadedRef = useRef<{ id: string; version: number } | null>(null);
 
   useEffect(() => {
     if (!sheet) {
       dispatch({ type: "LOADING", loading: false });
       return;
     }
-    // 只在"换了表格"时整体重载。
-    // 父组件在每次写入后都会重新拉取同一张表（refreshList/reloadSheet），
-    // 若按对象标识重载，会把本地撤销栈和乐观状态一起清掉。
-    if (loadedSheetRef.current === sheet.id) {
+    // 换了表格，或同一张表的服务端版本前进了（例如 Excel 导入、版本恢复），才整体重载。
+    // 父组件在每次写入后都会重新拉取同一张表；用版本号判断可避免把本地撤销栈清掉，
+    // 同时又能在导入这类"整表替换"后立刻刷新内容。
+    const previous = loadedRef.current;
+    const sameSnapshot = previous !== null && previous.id === sheet.id && previous.version >= sheet.version;
+    if (sameSnapshot) {
       dispatch({ type: "LOADING", loading: false });
       return;
     }
-    loadedSheetRef.current = sheet.id;
+    loadedRef.current = { id: sheet.id, version: sheet.version };
     dispatch({ type: "LOAD", sheet });
     versionRef.current = {};
     counterRef.current = 0;
@@ -455,6 +464,14 @@ export function useSheet(sheet: SheetData | null, onSheetChanged?: () => void): 
         case "error":
           notify(String(msg.message ?? "服务端拒绝了该操作"));
           break;
+        case "comment_added":
+          // 他人新增评论：交给评论 hook 合并（含角标计数）
+        case "comment_updated": {
+          const comment = msg.comment as Record<string, unknown> | undefined;
+          const counts = (msg.counts as Record<string, number>) ?? {};
+          if (comment) onCommentAddedRef.current?.(comment, counts);
+          break;
+        }
         default:
           break;
       }

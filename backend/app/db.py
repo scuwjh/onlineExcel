@@ -96,6 +96,20 @@ CREATE TABLE IF NOT EXISTS structure (
     element_id TEXT NOT NULL,
     PRIMARY KEY (sheet_id, axis, position)
 );
+
+CREATE TABLE IF NOT EXISTS comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sheet_id TEXT NOT NULL,
+    row_id TEXT NOT NULL,
+    col_id TEXT NOT NULL,
+    author_id INTEGER,
+    author TEXT NOT NULL,
+    body TEXT NOT NULL,
+    mentions TEXT NOT NULL DEFAULT '[]',
+    resolved INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_comments_sheet ON comments (sheet_id, id);
 """
 
 

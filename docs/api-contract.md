@@ -43,6 +43,8 @@ Authorization: Bearer <JWT>
 - `Op`：操作日志，`seq`（服务端单调分配）、`client_id`、`kind`、`payload`（含版本向量）。
 - `Version`：`id`、`parent_id`、`seq`、`ops`（**增量**）、`snapshot`（仅压缩点）、
   `base_rows` / `base_cols`（结构基线）、`user`、`message`、`created_at`。
+- `Comment`：`id`、`sheet_id`、`row_id` / `col_id`（**稳定元素 ID**，不是行号列号）、
+  `author_id`、`author`、`body`、`mentions`（JSON 数组）、`resolved`、`created_at`。
 
 ## 3. REST API
 
@@ -73,9 +75,36 @@ Authorization: Bearer <JWT>
 | GET | `/api/sheets/{id}/permissions` | owner | 成员列表 |
 | PUT | `/api/sheets/{id}/permissions` | owner | 授权/改角色，body `{"username","role"}` |
 | DELETE | `/api/sheets/{id}/permissions/{username}` | owner | 移除成员（所有者不可移除） |
+| DELETE | `/api/sheets/{id}` | owner | 删除表格，连带清理权限/单元格/结构/版本/操作日志/评论 |
+| POST | `/api/sheets/{id}/xlsx/parse` | editor | 解析上传的 xlsx，列出工作表名与统计（不落库）；body `{"data": base64, "sheet_name"?: string}` |
+| POST | `/api/sheets/{id}/xlsx/import` | editor | 把 xlsx 的一个工作表导入为表格内容（整体替换，生成一个版本） |
+| POST | `/api/sheets/{id}/xlsx/export` | viewer | 导出 `.xlsx`，body `{"frozen_rows"?, "frozen_cols"?}`；返回二进制附件 |
+| GET | `/api/sheets/{id}/comments?include_resolved=bool` | viewer | 评论列表 + 每格未解决计数 + 可提及成员 |
+| POST | `/api/sheets/{id}/comments` | commenter | 发表评论；body `{"row_id","col_id","body"}`，服务端解析并校验 `@提及` |
+| POST | `/api/sheets/{id}/comments/{cid}/resolve` | commenter | 标记解决/重新打开；body `{"resolved": bool}` |
+| DELETE | `/api/sheets/{id}/comments/{cid}` | commenter | 删除评论（作者本人，或 editor/owner） |
 
 响应统一为 `{"ok": true, "data": ...}`；失败为
 `{"ok": false, "error": "...", "code": "unauthorized|forbidden|not_found|invalid|rate_limited|error"}`。
+
+### Excel 语义（REQ-050）
+
+- 传输：xlsx 以 **base64** 放在 JSON body（避免引入 multipart 依赖），大小上限 `OE_MAX_XLSX_BYTES`（默认 10MB）。
+- 导出：保留公式原文（`=SUM(...)` 交由 Excel 求值，不写缓存值以免出现错误结果）、
+  字体加粗/斜体/下划线/字色、单元格底色、水平对齐、列宽与冻结窗格。
+- 导入：值原样落库（数字按数值写入导出、文本读回），公式以**文本**导入（前端公式引擎只覆盖
+  SUM/AVERAGE/IF，不保证求值）；合并单元格、条件格式、图表不导入；超长单元格按 `OE_MAX_CELL_CHARS` 跳过并计数返回。
+- 导出响应头文件名使用 RFC 5987 百分号编码（HTTP 头不能承载中文），并额外返回 `X-Filename`。
+
+### 评论与 @提醒（REQ-100）
+
+- 定位：评论存 `row_id`/`col_id`（稳定元素 ID），因此插入/删除行列后评论仍跟随原单元格；
+  写入时校验元素是否存在，不存在返回 400。
+- `@` 词法：`@` 后接字母/数字/`_`/`-`/`.`，或一段非空白字符（兼容中文用户名）；
+  只有**表格成员**的名字会被记入 `mentions`（避免把邮箱等误判为提醒）。
+- 字数上限 `OE_MAX_COMMENT_CHARS`（默认 2000）。
+- 广播：REST 与 WebSocket 两条写入路径都会向同表格房间推送
+  `comment_added` / `comment_updated`（含 `comment` 与权威 `counts`）。
 
 ## 4. WebSocket 协议
 
@@ -93,6 +122,7 @@ Authorization: Bearer <JWT>
 | `row_insert` / `col_insert` | `at`,`counter`（或 `element_id`）,`client_id`,`version` | 在 `at` 前插入；`element_id` 由客户端生成以保证幂等 |
 | `row_delete` / `col_delete` | `element_id`（或 `at`）,`client_id`,`version` | 按元素 ID 删除（推荐），索引作为兼容回退 |
 | `cursor` | `row`,`col` | 光标/选中位置，仅转发 |
+| `comment` | `row_id`,`col_id`,`body` | 发表评论（需 commenter 及以上），服务端广播 `comment_added` |
 | `ping` | - | 心跳，服务端回 `pong` |
 
 `version` 是**版本向量** `{clientId: seq}`：客户端把已见到的各客户端最大 `seq` 带上来，
@@ -108,6 +138,7 @@ Authorization: Bearer <JWT>
 | `cell_format` | 同上，带 `format` | |
 | `row_insert`/`row_delete`/`col_insert`/`col_delete` | `at`,`element_id`,`rowIds`,`colIds`,`rows`,`cols`,`cells`,`formats`,`seq` | 结构变化后附带权威投影 |
 | `sheet_import` | `rows`,`cols`,`rowIds`,`colIds`,`cells`,`formats` | 整体替换通知 |
+| `comment_added` / `comment_updated` | `comment`,`counts`,`mentions` | 评论新增或状态变更（`counts` 为权威角标计数） |
 | `cursor` | `row`,`col`,`user` | |
 | `presence` | `user`,`online`,`users` | 在线名单（`users` 为当前在线用户数组） |
 | `error` | `code`(`forbidden`/`invalid`/`unauthorized`),`message` | 单条操作级错误，连接保持 |
@@ -125,6 +156,9 @@ Authorization: Bearer <JWT>
   因此并发插入同一位置会同时保留，且不会出现坐标漂移（越界/过期坐标会被拒绝并提示）。
 - **删除即移除**：删除行/列会连同其单元格一起删除，不存在"幽灵单元"。
 - **离线兜底**：WebSocket 不可用时前端自动改走 REST，写操作语义完全一致。
+- **视图（筛选/排序）不是数据变更**：筛选与排序都只作用于本端展示顺序
+  （`Grid` 的 `rowOrder`），不改动单元格内容与存储顺序，因此无需协同合并；
+  空值在排序时恒排末尾；清除视图即恢复原始行序。
 - 仍未实现：完整 OT/CRDT 的结构重排合并（如"移动行"）、区域级冲突提示。
 
 ## 6. 版本与存储（diff 化）
@@ -154,6 +188,8 @@ Authorization: Bearer <JWT>
 | `OE_TOKEN_TTL` | `43200` | 令牌有效期（秒） |
 | `OE_ALLOWED_ORIGINS` | localhost:5173/8080 | CORS 白名单 |
 | `OE_MAX_ROWS` / `OE_MAX_COLS` / `OE_MAX_CELL_CHARS` | 100000 / 500 / 32767 | 输入校验上限 |
+| `OE_MAX_XLSX_BYTES` | 10485760 | Excel 导入文件大小上限（字节） |
+| `OE_MAX_COMMENT_CHARS` | 2000 | 单条评论长度上限 |
 | `OE_MAX_WS_MESSAGE` | 900000 | 单帧 WebSocket 体积上限 |
 | `OE_VERSION_SNAPSHOT_LIMIT` / `OE_VERSION_OP_LIMIT` | 20 / 5000 | 版本压缩参数 |
 | `OE_LOGIN_MAX_ATTEMPTS` | 20 | 每 IP 每分钟登录尝试上限 |

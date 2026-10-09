@@ -19,11 +19,19 @@ interface Props {
   onDeleteCol: () => void;
   onImport: (file: File) => void;
   onExport: () => void;
+  onImportXlsx: () => void;
+  onExportXlsx: () => void;
   frozen: boolean;
   onFreeze: () => void;
   onUnfreeze: () => void;
   onShowVersions: () => void;
   onShowPermissions: () => void;
+  onShowComments: () => void;
+  onShowView: () => void;
+  commentCount: number;
+  viewActive: boolean;
+  canDeleteSheet: boolean;
+  onDeleteSheet: () => void;
   onLogout: () => void;
   status: "connecting" | "open" | "closed";
   userName: string;
@@ -122,6 +130,28 @@ export default function Toolbar(props: Props) {
         导出 CSV
       </button>
       <span className="divider" />
+      <button onClick={props.onImportXlsx} disabled={!editable} title="从 Excel(.xlsx) 导入，覆盖当前表格">
+        导入 Excel
+      </button>
+      <button onClick={props.onExportXlsx} title="导出为 Excel(.xlsx)：保留公式、样式与冻结窗格">
+        导出 Excel
+      </button>
+      <span className="divider" />
+      <button
+        className={props.viewActive ? "active" : ""}
+        onClick={props.onShowView}
+        title="筛选与排序（仅影响本端显示）"
+      >
+        筛选排序{props.viewActive ? " ●" : ""}
+      </button>
+      <button
+        className={props.commentCount > 0 ? "active" : ""}
+        onClick={props.onShowComments}
+        title="评论与 @提醒"
+      >
+        评论{props.commentCount > 0 ? ` ${props.commentCount}` : ""}
+      </button>
+      <span className="divider" />
       <button onClick={props.onShowVersions} title="查看历史版本与对比">
         历史版本
       </button>
@@ -132,6 +162,9 @@ export default function Toolbar(props: Props) {
       <span className="sheet-name">{props.sheetName}</span>
       <button onClick={props.onNewSheet} title="新建表格">
         ＋ 新建表格
+      </button>
+      <button onClick={props.onDeleteSheet} disabled={!props.canDeleteSheet} title="删除当前表格（仅所有者，不可恢复）">
+        删除表格
       </button>
       <span className={`conn conn-${props.status}`} title={`连接状态：${props.status}`}>
         {props.status === "open" ? "已连接" : props.status === "connecting" ? "连接中" : "已断开"}

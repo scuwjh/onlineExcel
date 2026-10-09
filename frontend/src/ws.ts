@@ -39,6 +39,11 @@ export interface WsMessage {
   online?: boolean;
   /** 服务端因消息过大而拒绝附带全量投影时置位，客户端应改用 REST 拉取。 */
   reload?: boolean;
+  /** 评论广播（REQ-100）。 */
+  comment?: Record<string, unknown>;
+  counts?: Record<string, number>;
+  mentions?: string[];
+  body?: string;
   code?: string;
   message?: string;
   [key: string]: unknown;

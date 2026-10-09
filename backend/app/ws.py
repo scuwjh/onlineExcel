@@ -25,7 +25,7 @@ from typing import Dict, Optional, Set
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from . import auth, config, crdt, store
-from .db import get_conn
+from .db import get_conn, write_lock
 
 logger = logging.getLogger("online_excel.ws")
 router = APIRouter()
@@ -214,6 +214,42 @@ async def sheet_ws(websocket: WebSocket, sheet_id: str) -> None:
                 continue
             if mtype == "ping":
                 await manager.send(websocket, {"type": "pong", "seq": state.seq})
+                continue
+            if mtype == "comment":
+                # 评论通过 WebSocket 写入，权限要求 commenter 及以上
+                role = store.get_role(conn, sheet_id, user["id"])
+                if auth.role_level(role) < config.ROLE_LEVEL["commenter"]:
+                    await manager.send(
+                        websocket,
+                        {"type": "error", "code": "forbidden", "message": f"当前角色 {role or '无权限'} 不可评论"},
+                    )
+                    continue
+                body_text = str(msg.get("body") or "").strip()
+                if not body_text:
+                    await manager.send(websocket, {"type": "error", "code": "invalid", "message": "评论内容为空"})
+                    continue
+                if len(body_text) > config.MAX_COMMENT_CHARS:
+                    await manager.send(websocket, {"type": "error", "code": "invalid", "message": "评论内容超长"})
+                    continue
+                row_id = msg.get("row_id")
+                col_id = msg.get("col_id")
+                if row_id not in state.row_ids or col_id not in state.col_ids:
+                    await manager.send(
+                        websocket, {"type": "error", "code": "invalid", "message": "该单元格已不存在"}
+                    )
+                    continue
+                members = [m["username"] for m in store.sheet_members(conn, sheet_id)]
+                mentions = store.parse_mentions(body_text, members)
+                with write_lock:
+                    comment = store.add_comment(
+                        conn, sheet_id, str(row_id), str(col_id), body_text, user["id"], username, mentions
+                    )
+                    conn.commit()
+                    counts = store.comment_counts(conn, sheet_id)
+                await manager.broadcast(
+                    sheet_id,
+                    {"type": "comment_added", "comment": comment, "counts": counts, "mentions": mentions},
+                )
                 continue
             if mtype not in WRITE_KINDS and mtype not in STRUCT_KINDS:
                 await manager.send(
