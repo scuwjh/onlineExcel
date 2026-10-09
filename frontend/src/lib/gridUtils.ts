@@ -1,5 +1,6 @@
 import { DEFAULT_COLS, DEFAULT_ROWS } from "../types";
 
+/** 0 → A、25 → Z、26 → AA */
 export function colLabel(index: number): string {
   let n = index + 1;
   let label = "";
@@ -41,19 +42,6 @@ export function parseRange(ref: string): {
     start: { row: Math.min(start.row, end.row), col: Math.min(start.col, end.col) },
     end: { row: Math.max(start.row, end.row), col: Math.max(start.col, end.col) },
   };
-}
-
-export function transformGrid<T>(
-  map: Record<string, T>,
-  fn: (row: number, col: number) => { row: number; col: number } | null,
-): Record<string, T> {
-  const out: Record<string, T> = {};
-  for (const [key, val] of Object.entries(map)) {
-    const [r, c] = key.split(":").map(Number);
-    const res = fn(r, c);
-    if (res) out[cellKey(res.row, res.col)] = val;
-  }
-  return out;
 }
 
 export function inBounds(row: number, col: number, rows = DEFAULT_ROWS, cols = DEFAULT_COLS): boolean {
