@@ -427,14 +427,31 @@ select {
 
 /* 行号与表头单元：绝对定位（位置由 JS 计算），sticky 由内联样式声明 */
 .row-head,
-.grid-header .corner,
-.grid-header .col-head {
+.grid-header .corner {
   position: absolute;
   top: 0;
 }
 
 .row-head {
   top: auto;
+}
+
+/* 表头左上角：与行号列同宽，横向滚动时钉在左缘（数据列在其下方滚过） */
+.grid-header .corner {
+  position: sticky;
+  left: 0;
+  z-index: 46;
+  background: #f7f9fc;
+  box-shadow: 1px 0 0 var(--border);
+}
+
+/* 非冻结视图下的行号列：随行纵向滚动、横向钉在左缘；
+   冻结视图的行号由冻结层（.grid-frozen-*）接管渲染 */
+.grid-body .row-head {
+  position: sticky;
+  left: 0;
+  z-index: 25;
+  cursor: default;
 }
 
 .corner {
@@ -490,6 +507,13 @@ select {
 .cell.selected {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
+}
+
+/* 框选范围（非活动格）：浅色底表示选区，活动格仍有 .selected 描边 */
+.cell.in-range {
+  background-color: rgba(54, 120, 245, 0.07);
+  outline: 1px solid rgba(54, 120, 245, 0.35);
+  outline-offset: -1px;
 }
 
 .cell.remote {

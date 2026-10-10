@@ -81,7 +81,13 @@ def get_role(conn, sheet_id: str, user_id: Optional[int]) -> Optional[str]:
     ).fetchone()
     if row:
         return row["role"]
-    # 兼容历史表格：没有权限记录时，所有者可管理、其余认证用户可编辑（内部团队默认）。
+    # 兼容历史表格（v1 无权限体系）的兜底：
+    # - 表上有任何权限记录 → 未授权用户无权限（None）；
+    # - 有 owner 但无权限记录 → 其它用户无权限；
+    # - 既无权限记录又无 owner（迁移遗漏）→ 只读 viewer。
+    #   先前这里直接返回 "editor"：配合 OE_DEV_AUTO_REGISTER=1，任何能登录的人
+    #   都能编辑迁移过来的旧表。改为只读后，旧表只能被显式授权，或被
+    #   bootstrap.backfill_legacy_owners 指派 owner。
     legacy = conn.execute(
         "SELECT 1 FROM permissions WHERE sheet_id = ? LIMIT 1", (sheet_id,)
     ).fetchone()
@@ -91,7 +97,7 @@ def get_role(conn, sheet_id: str, user_id: Optional[int]) -> Optional[str]:
     if not sheet:
         return None
     if sheet["owner_id"] is None:
-        return "editor"
+        return "viewer"
     return None
 
 
@@ -348,8 +354,14 @@ def replace_sheet(
     user: str,
     client_id: str = "",
     formats: Optional[dict] = None,
+    row_ids: Optional[list] = None,
+    col_ids: Optional[list] = None,
 ) -> dict:
-    """整体替换（CSV 导入）→ 一条 ``replace`` 操作 + 一个版本。"""
+    """整体替换（CSV 导入 / 版本恢复）→ 一条 ``replace`` 操作 + 一个版本。
+
+    版本恢复（REQ-042）可传入 ``row_ids``/``col_ids`` 保留原元素 ID，
+    避免评论等按元素 ID 锚定的数据失效。
+    """
     if not (1 <= int(rows) <= config.MAX_ROWS and 1 <= int(cols) <= config.MAX_COLS):
         raise crdt.InvalidOperation(f"行列数超限：rows≤{config.MAX_ROWS}, cols≤{config.MAX_COLS}")
     payload = {
@@ -359,6 +371,10 @@ def replace_sheet(
         "formats": formats or {},
         "client": client_id or "import",
     }
+    if row_ids is not None:
+        payload["row_ids"] = row_ids
+    if col_ids is not None:
+        payload["col_ids"] = col_ids
     return apply_ops(sheet_id, [{"kind": crdt.OP_REPLACE, "payload": payload, "version": {}}], user, client_id)
 
 
@@ -456,12 +472,20 @@ def materialize_version(conn, sheet_id: str, version_id: int) -> crdt.SheetState
             data = json.loads(base["snapshot"])
         except (json.JSONDecodeError, TypeError):
             data = {}
+        # 快照可能是 v1 的逐格列表（迁移前遗留 / 迁移失败的库）：归一化后再用，
+        # 否则 data.get 会抛 AttributeError，把版本详情/对比/恢复整个打成 500。
+        projection = crdt.normalize_legacy_snapshot(data) or {
+            "rows": 0,
+            "cols": 0,
+            "cells": {},
+            "formats": {},
+        }
         state = crdt.state_from_projection(
             name="",
-            rows=int(data.get("rows", 0)),
-            cols=int(data.get("cols", 0)),
-            cells=data.get("cells") or {},
-            formats=data.get("formats") or {},
+            rows=projection["rows"],
+            cols=projection["cols"],
+            cells=projection["cells"],
+            formats=projection["formats"],
             batch=sheet_id,
         )
         state.sheet_id = sheet_id

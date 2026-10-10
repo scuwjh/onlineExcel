@@ -8,6 +8,55 @@ def test_health_is_public(client):
     assert client.get("/api/health").json()["data"]["status"] == "up"
 
 
+def test_null_owner_legacy_sheet_is_readonly_and_then_adopted(client, admin_headers, as_user):
+    """回归：无 owner 且无任何权限记录的历史表默认只读；启动引导后接管给管理员。
+
+    修复前 ``store.get_role`` 对这种情况直接返回 ``"editor"`` —— 配合自助注册
+    （``OE_DEV_AUTO_REGISTER=1``），任何能登录的用户都能编辑迁移过来的旧表，
+    且无人能管理/删除。修复后：未接管前只读（viewer），接管后归管理员
+    （owner），未授权用户不再可见。
+    """
+    from app import bootstrap, store
+    from app.db import get_conn
+
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO sheets (id, name, created_at, updated_at, rows, cols, owner_id) "
+        "VALUES ('orphan', '孤儿表', 't', 't', 5, 5, NULL)"
+    )
+    conn.commit()
+
+    stranger = as_user("stranger")
+    visible = client.get("/api/sheets", headers=stranger).json()["data"]
+    orphan = next((s for s in visible if s["id"] == "orphan"), None)
+    assert orphan is not None, "接管前，无主的旧表应对团队可见（只读）"
+    assert orphan["role"] == "viewer", "无主旧表只应降级为只读，而不是 editor"
+    assert (
+        client.put(
+            "/api/sheets/orphan/cells",
+            json={"updates": [{"row": 0, "col": 0, "value": "x"}]},
+            headers=stranger,
+        ).status_code
+        == 403
+    ), "viewer 写单元格必须被拒"
+
+    info = bootstrap.backfill_legacy_owners(conn)
+    conn.commit()
+    assert info == {"legacy_sheets_adopted": 1}
+
+    admin_id = store.get_user_by_name(conn, "admin")["id"]
+    stranger_id = store.get_user_by_name(conn, "stranger")["id"]
+    assert store.get_role(conn, "orphan", admin_id) == "owner"
+    assert store.get_role(conn, "orphan", stranger_id) is None
+
+    visible_after = client.get("/api/sheets", headers=stranger).json()["data"]
+    assert all(s["id"] != "orphan" for s in visible_after), "未授权用户不应再看到被接管的旧表"
+    admin_visible = client.get("/api/sheets", headers=admin_headers).json()["data"]
+    orphan_of_admin = next((s for s in admin_visible if s["id"] == "orphan"), None)
+    assert orphan_of_admin is not None and orphan_of_admin["role"] == "owner"
+    assert client.get("/api/health").json()["data"]["status"] == "up"
+
+
 def test_protected_endpoints_reject_anonymous(client):
     assert client.get("/api/sheets").status_code == 401
     assert client.post("/api/sheets", json={"name": "x"}).status_code == 401

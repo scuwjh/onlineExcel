@@ -390,6 +390,9 @@ def restore_version(sheet_id: str, version_id: int, user: dict = Depends(current
             user["username"],
             client_id=f"restore:{user['username']}",
             formats=projection["formats"],
+            # 保留原版本的行列元素 ID：评论等按元素 ID 锚定的数据不会因恢复而失效（REQ-042）
+            row_ids=state.row_ids,
+            col_ids=state.col_ids,
         )
     except crdt.InvalidOperation as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

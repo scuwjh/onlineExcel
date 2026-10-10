@@ -20,6 +20,8 @@ interface Props {
   rows: number;
   cols: number;
   selected: { row: number; col: number };
+  /** 框选锚点（Shift+方向键扩展选区时保持不变）。 */
+  anchor: { row: number; col: number };
   editing: { row: number; col: number } | null;
   draft: string;
   cursors: Record<string, Cursor>;
@@ -28,6 +30,12 @@ interface Props {
   self: string;
   readOnly: boolean;
   onSelect: (row: number, col: number) => void;
+  /** Shift+方向键：移动活动格并保持锚点。 */
+  onExtendSelect: (row: number, col: number) => void;
+  /** Ctrl+A：全选。 */
+  onSelectAll: () => void;
+  /** Delete/Backspace：清空选区。 */
+  onClearRange: (r0: number, c0: number, r1: number, c1: number) => void;
   onStartEdit: (row: number, col: number, draft: string) => void;
   onDraft: (draft: string) => void;
   onCommit: (row: number, col: number, value: string) => void;
@@ -68,6 +76,7 @@ export default function Grid(props: Props) {
     rows,
     cols,
     selected,
+    anchor,
     editing,
     draft,
     cursors,
@@ -76,6 +85,19 @@ export default function Grid(props: Props) {
     self,
     readOnly,
   } = props;
+
+  /** 当前选区（锚点与活动格之间的矩形；单格时缩成一个点）。 */
+  const range = useMemo(() => {
+    const r0 = Math.min(selected.row, anchor.row);
+    const r1 = Math.max(selected.row, anchor.row);
+    const c0 = Math.min(selected.col, anchor.col);
+    const c1 = Math.max(selected.col, anchor.col);
+    return { r0, r1, c0, c1 };
+  }, [selected, anchor]);
+  const inRange = useCallback(
+    (r: number, c: number) => r >= range.r0 && r <= range.r1 && c >= range.c0 && c <= range.c1,
+    [range],
+  );
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
@@ -207,6 +229,11 @@ export default function Grid(props: Props) {
       const { row, col } = selected;
       if (e.ctrlKey || e.metaKey) {
         const key = e.key.toLowerCase();
+        if (key === "a") {
+          e.preventDefault();
+          props.onSelectAll();
+          return;
+        }
         if (key === "z") {
           e.preventDefault();
           if (e.shiftKey) props.onRedo();
@@ -276,7 +303,10 @@ export default function Grid(props: Props) {
         case "Delete":
         case "Backspace":
           e.preventDefault();
-          if (!readOnly) props.onCommit(row, col, "");
+          if (!readOnly) {
+            if (range.r1 > range.r0 || range.c1 > range.c0) props.onClearRange(range.r0, range.c0, range.r1, range.c1);
+            else props.onCommit(row, col, "");
+          }
           return;
         case "Tab": {
           e.preventDefault();
@@ -297,12 +327,14 @@ export default function Grid(props: Props) {
 
       e.preventDefault();
       if (nr !== row || nc !== col) {
-        props.onMove(nr, nc);
+        // Shift+方向键扩展选区：只移动活动格，锚点不动
+        if (e.shiftKey) props.onExtendSelect(nr, nc);
+        else props.onMove(nr, nc);
         scrollIntoView(nr, nc);
       }
       focusShell();
     },
-    [selected, cells, rows, cols, readOnly, props, size.height, scrollIntoView, focusShell, beginEdit],
+    [selected, cells, rows, cols, readOnly, props, size.height, scrollIntoView, focusShell, beginEdit, range, inRange],
   );
 
   // 事件委托：整表一个处理器，避免每个单元格各带闭包。
@@ -439,6 +471,7 @@ export default function Grid(props: Props) {
       {colsToRender.map((c) => {
         const key = cellKey(r, c);
         const isSelected = selected.row === r && selected.col === c;
+        const isInRange = inRange(r, c);
         const remote = Object.values(cursors).some(
           (cur) => cur.user !== self && cur.row === r && cur.col === c,
         );
@@ -452,7 +485,7 @@ export default function Grid(props: Props) {
             col={c}
             value={cells[key] ?? null}
             style={cellStyle(formats[key], c < frozenCols, isSelected)}
-            className={`cell${c < frozenCols ? " frozen" : ""}${isSelected ? " selected" : ""}`}
+            className={`cell${c < frozenCols ? " frozen" : ""}${isSelected ? " selected" : isInRange ? " in-range" : ""}`}
             remote={remote}
             cells={cells}
             commentCount={commentCount}
@@ -513,12 +546,13 @@ export default function Grid(props: Props) {
         <div className="grid-space" style={{ width: ROW_HEAD_W + bodyWidth, height: HEADER_H + bodyHeight }}>
           {/* 表头（sticky 顶部；只含非冻结列，冻结列头在左上/左侧层） */}
           <div className="grid-header" style={{ height: HEADER_H, width: ROW_HEAD_W + bodyWidth }}>
-            <div className="grid-spacer" style={{ width: ROW_HEAD_W }} />
+            {/* 左上角（行号列与表头交汇处）：横向滚动时钉在左缘 */}
+            <div className="corner" />
             {leftPad > 0 && <div className="grid-spacer" style={{ width: leftPad }} />}
             {scrolledCols.map((c) => (
               <div
                 key={`h-${c}`}
-                className={`col-head${c === selected.col ? " active" : ""}`}
+                className={`col-head${c >= range.c0 && c <= range.c1 ? " active" : ""}`}
                 style={{ flex: "none", zIndex: 40 }}
               >
                 {colLabel(c)}
@@ -541,7 +575,12 @@ export default function Grid(props: Props) {
                   className="grid-row"
                   style={{ top: slot * ROW_H, height: ROW_H, width: ROW_HEAD_W + bodyWidth }}
                 >
-                  <div className="grid-spacer" style={{ width: ROW_HEAD_W + frozenCols * COL_W }} />
+                  {frozenCols === 0 ? (
+                    <div className={`row-head${r >= range.r0 && r <= range.r1 ? " active" : ""}`}>{r + 1}</div>
+                  ) : (
+                    <div className="grid-spacer" style={{ width: ROW_HEAD_W }} />
+                  )}
+                  {frozenCols > 0 && <div className="grid-spacer" style={{ width: frozenCols * COL_W }} />}
                   {renderCells(r, scrolledCols, leftPad)}
                   {rightPad > 0 && <div className="grid-spacer" style={{ width: rightPad }} />}
                 </div>
@@ -562,30 +601,37 @@ export default function Grid(props: Props) {
               }}
             >
               <div className="frozen-cols-head" style={{ height: HEADER_H }}>
+                {/* 行号列宽占位：让冻结列头与下方数据列对齐 */}
+                <div className="grid-spacer" style={{ width: ROW_HEAD_W }} />
                 {frozenColList.map((c) => (
                   <div
                     key={`fch-${c}`}
-                    className={`col-head frozen${c === selected.col ? " active" : ""}`}
+                    className={`col-head frozen${c >= range.c0 && c <= range.c1 ? " active" : ""}`}
                     style={{ flex: "none" }}
                   >
                     {colLabel(c)}
                   </div>
                 ))}
               </div>
-              {frozenRowList.map((r) => (
-                <div
-                  key={r}
-                  className="grid-row"
-                  style={{
-                    top: HEADER_H + orderIndexOf(r) * ROW_H - view.scrollTop,
-                    height: ROW_H,
-                    width: frozenColsW,
-                  }}
-                >
-                  <div className={`row-head frozen${r === selected.row ? " active" : ""}`}>{r + 1}</div>
-                  {renderCells(r, frozenColList, 0)}
-                </div>
-              ))}
+              {/* 滚动区每一行的冻结列：行内容在文档坐标随纵向滚动，横向被层钉住。
+                  之前只渲染冻结行（frozenRowList），导致普通行的冻结列数据消失。 */}
+              {visibleRows.map((slot) => {
+                const r = rowAt(slot);
+                return (
+                  <div
+                    key={r}
+                    className="grid-row"
+                    style={{
+                      top: HEADER_H + orderIndexOf(r) * ROW_H - view.scrollTop,
+                      height: ROW_H,
+                      width: frozenColsW,
+                    }}
+                  >
+                    <div className={`row-head frozen${r >= range.r0 && r <= range.r1 ? " active" : ""}`}>{r + 1}</div>
+                    {renderCells(r, frozenColList, 0)}
+                  </div>
+                );
+              })}
             </div>
           )}
 
@@ -606,7 +652,9 @@ export default function Grid(props: Props) {
                   className="grid-row"
                   style={{ top: r * ROW_H, height: ROW_H, width: ROW_HEAD_W + bodyWidth }}
                 >
-                  <div className={`row-head frozen${r === selected.row ? " active" : ""}`}>{r + 1}</div>
+                  <div className={`row-head frozen${r >= range.r0 && r <= range.r1 ? " active" : ""}`}>{r + 1}</div>
+                  {/* 让出冻结列宽度，与滚动区非冻结列对齐 */}
+                  {frozenCols > 0 && <div className="grid-spacer" style={{ width: frozenCols * COL_W }} />}
                   {renderCells(r, scrolledCols, leftPad)}
                   {rightPad > 0 && <div className="grid-spacer" style={{ width: rightPad }} />}
                 </div>
@@ -631,7 +679,7 @@ export default function Grid(props: Props) {
                   className="grid-row"
                   style={{ top: r * ROW_H, height: ROW_H, width: frozenColsW }}
                 >
-                  <div className={`row-head frozen${r === selected.row ? " active" : ""}`}>{r + 1}</div>
+                  <div className={`row-head frozen${r >= range.r0 && r <= range.r1 ? " active" : ""}`}>{r + 1}</div>
                   {renderCells(r, frozenColList, 0)}
                 </div>
               ))}
@@ -643,8 +691,11 @@ export default function Grid(props: Props) {
       </div>
       <div className="grid-status">
         <span>
-          选中 {colLabel(selected.col)}
-          {selected.row + 1}
+          选中 {colLabel(range.c0)}
+          {range.r0 + 1}
+          {range.r1 > range.r0 || range.c1 > range.c0
+            ? ` : ${colLabel(range.c1)}${range.r1 + 1}（${range.r1 - range.r0 + 1}行 × ${range.c1 - range.c0 + 1}列）`
+            : ""}
         </span>
         <span className="muted">
           共 {rows.toLocaleString("en-US")} 行 × {cols} 列

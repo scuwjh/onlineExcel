@@ -400,8 +400,16 @@ def _apply_replace(state: SheetState, payload: dict, *, seq: int, client_id: str
     if rows < 0 or cols < 0:
         raise InvalidOperation("行列数不能为负")
     batch = payload.get("client") or client_id
-    state.row_ids = [element_id(batch, i, "row") for i in range(rows)]
-    state.col_ids = [element_id(batch, i, "col") for i in range(cols)]
+    # 版本恢复（REQ-042）会带上原版本的行列元素 ID：评论、历史操作等锚点不会因此失效。
+    # 未提供时（普通导入）按批次生成全新 ID。
+    row_ids = payload.get("row_ids")
+    col_ids = payload.get("col_ids")
+    if row_ids is not None and (not isinstance(row_ids, list) or len(row_ids) != rows):
+        raise InvalidOperation("row_ids 与 rows 数量不一致")
+    if col_ids is not None and (not isinstance(col_ids, list) or len(col_ids) != cols):
+        raise InvalidOperation("col_ids 与 cols 数量不一致")
+    state.row_ids = [str(x) for x in row_ids] if row_ids else [element_id(batch, i, "row") for i in range(rows)]
+    state.col_ids = [str(x) for x in col_ids] if col_ids else [element_id(batch, i, "col") for i in range(cols)]
     state.values = {}
     state.formats = {}
     version = {client_id: seq}
@@ -522,6 +530,81 @@ def state_from_projection(name: str, rows: int, cols: int, cells: dict, formats:
                 value=json.dumps(fmt, ensure_ascii=False)
             )
     return state
+
+
+def _safe_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _decode_legacy_format(raw):
+    """解码 v1 单元格样式。
+
+    v1 把样式以 **JSON 字符串** 存进快照（例如 ``'{"align": "right"}'``），而
+    ``state_from_projection`` / ``apply_op`` 期望的是对象（内部再做 ``json.dumps``）。
+    这里必须解码，否则样式会被二次编码成字符串，前端拿到的是字符串而非样式对象。
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return decoded if isinstance(decoded, dict) else None
+    return raw if isinstance(raw, dict) else None
+
+
+def normalize_legacy_snapshot(data) -> Optional[dict]:
+    """把历史快照归一化为 ``project()`` 形态的投影 ``{"rows","cols","cells","formats"}``。
+
+    兼容两种真实存在过的存储格式：
+
+    - **v2 快照**（dict）：``{"rows":16,"cols":8,"cells":{"0:0":"a"},"formats":{...}}``
+    - **v1 快照**（list）：``[{"row":0,"col":0,"value":"a","format":"{\\"align\\":\\"right\\"}"}, ...]``
+      —— 只记录非空单元格，行列数需要由最大下标推导。
+
+    无法识别时返回 ``None``。
+    """
+    if isinstance(data, dict):
+        return {
+            "rows": _safe_int(data.get("rows")),
+            "cols": _safe_int(data.get("cols")),
+            "cells": dict(data.get("cells") or {}),
+            "formats": dict(data.get("formats") or {}),
+        }
+    if not isinstance(data, list):
+        return None
+
+    cells: dict = {}
+    formats: dict = {}
+    max_row = -1
+    max_col = -1
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            r = int(entry.get("row", -1))
+            c = int(entry.get("col", -1))
+        except (TypeError, ValueError):
+            continue
+        if r < 0 or c < 0:
+            continue
+        key = cell_key(r, c)
+        if r > max_row:
+            max_row = r
+        if c > max_col:
+            max_col = c
+        value = entry.get("value")
+        if value is not None and value != "":
+            cells[key] = value
+        fmt = _decode_legacy_format(entry.get("format"))
+        if fmt is not None:
+            formats[key] = fmt
+    # 行列数取最大下标 +1（v1 快照不含行列数）；调用方可再用表格当前尺寸取大者兜底。
+    return {"rows": max_row + 1, "cols": max_col + 1, "cells": cells, "formats": formats}
 
 
 def state_to_ops(state: SheetState, *, seq: int, client_id: str) -> list:

@@ -90,15 +90,23 @@ function matches(text: string, filter: ColumnFilter): boolean {
   return text.trim() !== "";
 }
 
-/** 计算「可见行」的展示顺序：先筛选，再按排序规则重排。 */
+/** 计算「可见行」的展示顺序：先筛选，再按排序规则重排。
+ *
+ * 第 0 行视为**表头行**：恒在首位，既不参与排序，也不会被筛选隐藏
+ * （与 Excel「我的数据包含标题」的直觉一致）。
+ */
 export function computeRowOrder(
   rows: number,
   cells: Cells,
   filters: ColumnFilter[],
   sort: SortRule | null,
 ): number[] {
+  const HEADER_ROW = 0;
   let order: number[] = [];
-  for (let r = 0; r < rows; r++) order.push(r);
+  for (let r = 0; r < rows; r++) {
+    if (r === HEADER_ROW) continue;
+    order.push(r);
+  }
 
   if (filters.length) {
     order = order.filter((r) => filters.every((f) => matches(valueOf(cells, r, f.col), f)));
@@ -111,7 +119,7 @@ export function computeRowOrder(
       return diff !== 0 ? diff : a - b; // 同值保持稳定（按原行号）
     });
   }
-  return order;
+  return [HEADER_ROW, ...order];
 }
 
 /** 该行是否因为筛选被隐藏（用于状态栏提示）。 */

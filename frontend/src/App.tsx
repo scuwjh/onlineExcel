@@ -396,6 +396,7 @@ export default function App() {
           rows={sheetApi.state.rows}
           cols={sheetApi.state.cols}
           selected={sheetApi.state.selected}
+          anchor={sheetApi.state.anchor}
           editing={sheetApi.state.editing}
           draft={sheetApi.state.draft}
           cursors={sheetApi.state.cursors}
@@ -404,6 +405,9 @@ export default function App() {
           self={userName}
           readOnly={!sheetApi.editable}
           onSelect={sheetApi.select}
+          onExtendSelect={sheetApi.extendSelect}
+          onSelectAll={sheetApi.selectAll}
+          onClearRange={sheetApi.clearRange}
           onStartEdit={sheetApi.startEdit}
           onDraft={sheetApi.setDraft}
           onCommit={sheetApi.commitCell}

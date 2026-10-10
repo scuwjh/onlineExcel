@@ -12,10 +12,26 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
 import * as api from "../api";
 import { cellKey } from "../lib/gridUtils";
+import { structureDeltas } from "../lib/structure";
 import { cellsToCsv, csvToCells, parseClipboardGrid } from "../lib/csv";
 import type { CellFormat, Cells, Cursor, Role, SheetData } from "../types";
 import { DEFAULT_COLS, DEFAULT_ROWS } from "../types";
 import { connectWS, type WsClient, type WsMessage } from "../ws";
+
+export interface CellPoint {
+  row: number;
+  col: number;
+}
+
+/** 撤销/重做快照：一次写操作前的完整状态（单元格值 + 格式 + 结构）。 */
+export interface HistoryEntry {
+  cells: Cells;
+  formats: Record<string, CellFormat>;
+  rows: number;
+  cols: number;
+  rowIds: string[];
+  colIds: string[];
+}
 
 export interface SheetState {
   sheetId: string | null;
@@ -29,15 +45,17 @@ export interface SheetState {
   cols: number;
   version: number;
   seq: number;
-  selected: { row: number; col: number };
-  editing: { row: number; col: number } | null;
+  selected: CellPoint;
+  /** 框选锚点：与 selected 一起构成选区（REQ-002/003）。 */
+  anchor: CellPoint;
+  editing: CellPoint | null;
   draft: string;
   users: Record<string, boolean>;
   cursors: Record<string, Cursor>;
   frozenRows: number;
   frozenCols: number;
-  history: Cells[];
-  future: Cells[];
+  history: HistoryEntry[];
+  future: HistoryEntry[];
   status: "connecting" | "open" | "closed";
   error: string | null;
   loading: boolean;
@@ -46,6 +64,8 @@ export interface SheetState {
 type Action =
   | { type: "LOAD"; sheet: SheetData }
   | { type: "SELECT"; row: number; col: number }
+  | { type: "SELECT_EXTEND"; row: number; col: number }
+  | { type: "SELECT_ALL"; rows: number; cols: number }
   | { type: "START_EDIT"; row: number; col: number; draft: string }
   | { type: "SET_DRAFT"; draft: string }
   | { type: "CANCEL_EDIT" }
@@ -53,7 +73,7 @@ type Action =
   | { type: "LOCAL_CELLS"; updates: Record<string, string | null>; record?: boolean }
   | { type: "REMOTE_CELL"; row: number; col: number; value: string | null; cells?: Cells; version?: number; seq?: number }
   | { type: "REMOTE_FORMAT"; row: number; col: number; format: CellFormat | null; formats?: Record<string, CellFormat> }
-  | { type: "LOCAL_FORMAT"; row: number; col: number; format: CellFormat }
+  | { type: "LOCAL_FORMAT"; row: number; col: number; format: CellFormat | null; record?: boolean }
   | {
       type: "REMOTE_STRUCTURE";
       cells?: Cells;
@@ -64,6 +84,10 @@ type Action =
       cols?: number;
       seq?: number;
       version?: number;
+      /** 本端自己发出的结构操作回执：把操作前的快照压入撤销栈。 */
+      record?: HistoryEntry;
+      /** 结构撤销/重做的回执期间：保留现有撤销/重做栈，不被清空。 */
+      preserve?: boolean;
     }
   | { type: "SET_CURSOR"; cursor: Cursor }
   | { type: "SET_PRESENCE"; user: string; online: boolean; users?: string[] }
@@ -89,6 +113,7 @@ const initialState: SheetState = {
   version: 0,
   seq: 0,
   selected: { row: 0, col: 0 },
+  anchor: { row: 0, col: 0 },
   editing: null,
   draft: "",
   users: {},
@@ -104,8 +129,20 @@ const initialState: SheetState = {
 
 const HISTORY_LIMIT = 50;
 
-function pushHistory(state: SheetState, cells: Cells): Cells[] {
-  return [...state.history, cells].slice(-HISTORY_LIMIT);
+/** 取当前状态的撤销快照（含格式与结构），历史栈与重做栈均用此类型。 */
+function snapshotOf(state: SheetState): HistoryEntry {
+  return {
+    cells: state.cells,
+    formats: state.formats,
+    rows: state.rows,
+    cols: state.cols,
+    rowIds: state.rowIds,
+    colIds: state.colIds,
+  };
+}
+
+function pushHistory(state: SheetState, entry: HistoryEntry): HistoryEntry[] {
+  return [...state.history, entry].slice(-HISTORY_LIMIT);
 }
 
 function reducer(state: SheetState, action: Action): SheetState {
@@ -128,7 +165,23 @@ function reducer(state: SheetState, action: Action): SheetState {
         loading: false,
       };
     case "SELECT":
+      return {
+        ...state,
+        selected: { row: action.row, col: action.col },
+        anchor: { row: action.row, col: action.col },
+        editing: null,
+      };
+    case "SELECT_EXTEND":
+      // Shift+方向键：移动活动格，但保持锚点不动 → 选区扩大/收缩
       return { ...state, selected: { row: action.row, col: action.col }, editing: null };
+    case "SELECT_ALL":
+      return {
+        ...state,
+        // 活动格放在右下角，锚点放在左上角 → 覆盖整张表
+        selected: { row: Math.max(0, action.rows - 1), col: Math.max(0, action.cols - 1) },
+        anchor: { row: 0, col: 0 },
+        editing: null,
+      };
     case "START_EDIT":
       return {
         ...state,
@@ -147,7 +200,7 @@ function reducer(state: SheetState, action: Action): SheetState {
         ...state,
         cells: { ...state.cells, [key]: action.value },
         editing: null,
-        history: record ? pushHistory(state, state.cells) : state.history,
+        history: record ? pushHistory(state, snapshotOf(state)) : state.history,
         future: record ? [] : state.future,
       };
     }
@@ -159,7 +212,7 @@ function reducer(state: SheetState, action: Action): SheetState {
         ...state,
         cells,
         editing: null,
-        history: record ? pushHistory(state, state.cells) : state.history,
+        history: record ? pushHistory(state, snapshotOf(state)) : state.history,
         future: record ? [] : state.future,
       };
     }
@@ -184,9 +237,35 @@ function reducer(state: SheetState, action: Action): SheetState {
     }
     case "LOCAL_FORMAT": {
       const key = cellKey(action.row, action.col);
-      return { ...state, formats: { ...state.formats, [key]: action.format } };
+      const formats = { ...state.formats };
+      if (action.format && Object.keys(action.format).length) formats[key] = action.format;
+      else delete formats[key];
+      const record = action.record !== false;
+      return {
+        ...state,
+        formats,
+        history: record ? pushHistory(state, snapshotOf(state)) : state.history,
+        future: record ? [] : state.future,
+      };
     }
-    case "REMOTE_STRUCTURE":
+    case "REMOTE_STRUCTURE": {
+      // 本端自己的结构操作回执（record）→ 压入撤销栈；结构撤销/重做回执（preserve）→ 保留栈
+      if (action.record) {
+        return {
+          ...state,
+          cells: action.cells ?? state.cells,
+          formats: action.formats ?? state.formats,
+          rowIds: action.rowIds ?? state.rowIds,
+          colIds: action.colIds ?? state.colIds,
+          rows: action.rows ?? state.rows,
+          cols: action.cols ?? state.cols,
+          seq: action.seq ?? state.seq,
+          version: action.version ?? state.version,
+          editing: null,
+          history: pushHistory(state, action.record),
+          future: [],
+        };
+      }
       return {
         ...state,
         cells: action.cells ?? state.cells,
@@ -198,9 +277,10 @@ function reducer(state: SheetState, action: Action): SheetState {
         seq: action.seq ?? state.seq,
         version: action.version ?? state.version,
         editing: null,
-        history: [],
-        future: [],
+        history: action.preserve ? state.history : [],
+        future: action.preserve ? state.future : [],
       };
+    }
     case "SET_CURSOR":
       return { ...state, cursors: { ...state.cursors, [action.cursor.user]: action.cursor } };
     case "SET_PRESENCE": {
@@ -234,9 +314,14 @@ function reducer(state: SheetState, action: Action): SheetState {
       const prev = state.history[state.history.length - 1];
       return {
         ...state,
-        cells: prev,
+        cells: prev.cells,
+        formats: prev.formats,
+        rows: prev.rows,
+        cols: prev.cols,
+        rowIds: prev.rowIds,
+        colIds: prev.colIds,
         history: state.history.slice(0, -1),
-        future: [...state.future, state.cells].slice(-HISTORY_LIMIT),
+        future: [...state.future, snapshotOf(state)].slice(-HISTORY_LIMIT),
         editing: null,
       };
     }
@@ -245,9 +330,14 @@ function reducer(state: SheetState, action: Action): SheetState {
       const next = state.future[state.future.length - 1];
       return {
         ...state,
-        cells: next,
+        cells: next.cells,
+        formats: next.formats,
+        rows: next.rows,
+        cols: next.cols,
+        rowIds: next.rowIds,
+        colIds: next.colIds,
+        history: pushHistory(state, snapshotOf(state)),
         future: state.future.slice(0, -1),
-        history: pushHistory(state, state.cells),
         editing: null,
       };
     }
@@ -270,12 +360,51 @@ function asNumber(value: unknown): number | undefined {
   return typeof value === "number" ? value : undefined;
 }
 
+function sameIds(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((id, i) => id === b[i]);
+}
+
+/** 两个 cell 快照（按 "row:col" 索引）的差异 → 需要写回的值表。 */
+function diffCells(from: Cells, to: Cells): Record<string, string | null> {
+  const keys = new Set([...Object.keys(from), ...Object.keys(to)]);
+  const updates: Record<string, string | null> = {};
+  for (const key of keys) {
+    const a = from[key] ?? null;
+    const b = to[key] ?? null;
+    if (a !== b) updates[key] = b;
+  }
+  return updates;
+}
+
+/** 两个 format 快照的差异（空对象视为删除）。 */
+function diffFormats(
+  from: Record<string, CellFormat>,
+  to: Record<string, CellFormat>,
+): Record<string, CellFormat | null> {
+  const keys = new Set([...Object.keys(from), ...Object.keys(to)]);
+  const updates: Record<string, CellFormat | null> = {};
+  for (const key of keys) {
+    const a = from[key] ?? null;
+    const b = to[key] ?? null;
+    const an = a && Object.keys(a).length ? a : null;
+    const bn = b && Object.keys(b).length ? b : null;
+    if (JSON.stringify(an ?? {}) !== JSON.stringify(bn ?? {})) updates[key] = bn;
+  }
+  return updates;
+}
+
 export interface UseSheetResult {
   state: SheetState;
   editable: boolean;
   canUndo: boolean;
   canRedo: boolean;
   select: (row: number, col: number) => void;
+  /** Shift+方向键：移动活动格并保持锚点（扩展选区）。 */
+  extendSelect: (row: number, col: number) => void;
+  /** Ctrl+A：全选。 */
+  selectAll: () => void;
+  /** 清空选区内的所有单元格（Delete/Backspace）。 */
+  clearRange: (r0: number, c0: number, r1: number, c1: number) => void;
   startEdit: (row: number, col: number, draft: string) => void;
   setDraft: (draft: string) => void;
   cancelEdit: () => void;
@@ -323,6 +452,17 @@ export function useSheet(
   const clearHistory = useCallback(() => dispatch({ type: "CLEAR_HISTORY" }), []);
 
   const loadedRef = useRef<{ id: string; version: number } | null>(null);
+
+  /**
+   * 结构操作回执守卫：
+   * - ``op``：本端刚发出一次普通的插入/删除行列，回执到达时把操作前的快照压入撤销栈；
+   * - ``undo``/``redo``：本端正在重放结构差异（一次可能多条 op），回执期间保留撤销栈不清空。
+   */
+  const structureGuardRef = useRef<
+  | { kind: "op"; record: HistoryEntry }
+  | { kind: "undo" | "redo"; remaining: number }
+  | null
+>(null);
 
   useEffect(() => {
     if (!sheet) {
@@ -427,7 +567,21 @@ export function useSheet(
         case "row_delete":
         case "col_insert":
         case "col_delete":
-        case "sheet_import":
+        case "sheet_import": {
+          // 本端自己发起的结构操作回执：见 structureGuardRef 注释
+          const guard = structureGuardRef.current;
+          let record: HistoryEntry | undefined;
+          let preserve = false;
+          if (guard) {
+            if (guard.kind === "op") {
+              structureGuardRef.current = null;
+              record = guard.record;
+            } else {
+              guard.remaining -= 1;
+              if (guard.remaining <= 0) structureGuardRef.current = null;
+              preserve = true;
+            }
+          }
           if (msg.reload) {
             void api
               .getSheet(stateRef.current.sheetId ?? "")
@@ -445,8 +599,11 @@ export function useSheet(
             cols: msg.cols,
             seq: asNumber(msg.seq),
             version: asNumber(msg.version),
+            record,
+            preserve,
           });
           break;
+        }
         case "cursor":
           dispatch({
             type: "SET_CURSOR",
@@ -520,6 +677,22 @@ export function useSheet(
     [send],
   );
 
+  const extendSelect = useCallback(
+    (row: number, col: number) => {
+      const { rows, cols } = stateRef.current;
+      const nr = Math.max(0, Math.min(rows - 1, row));
+      const nc = Math.max(0, Math.min(cols - 1, col));
+      dispatch({ type: "SELECT_EXTEND", row: nr, col: nc });
+      send({ type: "cursor", row: nr, col: nc });
+    },
+    [send],
+  );
+
+  const selectAll = useCallback(() => {
+    const { rows, cols } = stateRef.current;
+    dispatch({ type: "SELECT_ALL", rows, cols });
+  }, []);
+
   const startEdit = useCallback(
     (row: number, col: number, draft: string) => {
       if (!editable) return;
@@ -572,21 +745,25 @@ export function useSheet(
     [bump, editable, localId, notify, send],
   );
 
-  const applyCellMap = useCallback(
-    (updates: Record<string, string | null>, record = true) => {
-      if (!Object.keys(updates).length) return;
-      dispatch({ type: "LOCAL_CELLS", updates, record });
-      const sheetId = stateRef.current.sheetId;
+  /** 把单元格写入目标列表发给服务端（WS 优先，大批量走 REST 分块；不碰本地状态）。 */
+  const sendCellTargets = useCallback(
+    (payload: api.CellTarget[], pendingKeys: string[], sheetId: string | null) => {
+      if (!payload.length) return;
       const version = bump();
-      const payload: api.CellTarget[] = Object.entries(updates).map(([key, value]) => {
-        const [row, col] = key.split(":").map(Number);
-        pendingBatchRef.current.add(`${row}:${col}:${value === null ? "" : value}`);
-        return {
-          row_id: stateRef.current.rowIds[row],
-          col_id: stateRef.current.colIds[col],
-          value,
-        };
-      });
+      for (const key of pendingKeys) pendingBatchRef.current.add(key);
+      // 大批量写入（框选清空 / 大块粘贴 / 撤销回放）：逐格走 WS 消息太多，改走 REST 分块，
+      // 服务端同样会应用并把权威投影广播回来。
+      if (payload.length > 300) {
+        if (sheetId) {
+          const CHUNK = 1000;
+          for (let i = 0; i < payload.length; i += CHUNK) {
+            api
+              .updateCells(sheetId, payload.slice(i, i + CHUNK), version)
+              .catch((err) => notify(String(err.message ?? err)));
+          }
+        }
+        return;
+      }
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
         if (sheetId) {
           api.updateCells(sheetId, payload, version).catch((err) => notify(String(err.message ?? err)));
@@ -607,6 +784,27 @@ export function useSheet(
     [bump, localId, notify, send],
   );
 
+  const applyCellMap = useCallback(
+    (updates: Record<string, string | null>, record = true) => {
+      if (!Object.keys(updates).length) return;
+      dispatch({ type: "LOCAL_CELLS", updates, record });
+      const sheetId = stateRef.current.sheetId;
+      const payload: api.CellTarget[] = [];
+      const keys: string[] = [];
+      for (const [key, value] of Object.entries(updates)) {
+        const [row, col] = key.split(":").map(Number);
+        keys.push(`${row}:${col}:${value === null ? "" : value}`);
+        payload.push({
+          row_id: stateRef.current.rowIds[row],
+          col_id: stateRef.current.colIds[col],
+          value,
+        });
+      }
+      sendCellTargets(payload, keys, sheetId);
+    },
+    [sendCellTargets],
+  );
+
   const pasteBlock = useCallback(
     (row: number, col: number, text: string) => {
       if (!editable) return;
@@ -622,6 +820,25 @@ export function useSheet(
           }
         });
       });
+      applyCellMap(updates);
+    },
+    [applyCellMap, editable],
+  );
+
+  /** Delete/Backspace：清空选区内的所有单元格（一次记录，可撤销）。 */
+  const clearRange = useCallback(
+    (r0: number, c0: number, r1: number, c1: number) => {
+      if (!editable) return;
+      const { rows, cols, cells } = stateRef.current;
+      const updates: Record<string, string | null> = {};
+      for (let r = Math.max(0, r0); r <= Math.min(rows - 1, r1); r++) {
+        for (let c = Math.max(0, c0); c <= Math.min(cols - 1, c1); c++) {
+          const key = cellKey(r, c);
+          if (cells[key] !== undefined && cells[key] !== null && cells[key] !== "") {
+            updates[key] = null;
+          }
+        }
+      }
       applyCellMap(updates);
     },
     [applyCellMap, editable],
@@ -661,10 +878,12 @@ export function useSheet(
   const structural = useCallback(
     (kind: "row_insert" | "row_delete" | "col_insert" | "col_delete") => {
       if (!editable) return;
-      const { selected, rowIds, colIds } = stateRef.current;
+      const before = stateRef.current;
       const axisRow = kind.startsWith("row");
-      const at = axisRow ? selected.row : selected.col;
-      const elementId = axisRow ? rowIds[at] : colIds[at];
+      const at = axisRow ? before.selected.row : before.selected.col;
+      const elementId = axisRow ? before.rowIds[at] : before.colIds[at];
+      // 记录操作前的快照：回执到达时压入撤销栈 → 插入/删除行列可撤销
+      structureGuardRef.current = { kind: "op", record: snapshotOf(before) };
       const payload: WsMessage = { type: kind, at, client_id: localId, version: bump() };
       if (kind === "row_insert" || kind === "col_insert") {
         counterRef.current += 1;
@@ -683,36 +902,129 @@ export function useSheet(
   const deleteCol = useCallback(() => structural("col_delete"), [structural]);
 
   /** 计算把 ``target`` 恢复成当前状态所需的单元格写入。 */
-  const restoreTargets = useCallback((target: Cells): Record<string, string | null> => {
-    const { cells, rowIds, colIds } = stateRef.current;
-    const updates: Record<string, string | null> = {};
-    for (let r = 0; r < rowIds.length; r++) {
-      for (let c = 0; c < colIds.length; c++) {
-        const key = cellKey(r, c);
-        const before = target[key] ?? null;
-        const now = cells[key] ?? null;
-        if (before !== now) updates[key] = before;
+  /** 撤销/重做时，把结构迁移到目标快照：先删后插，元素 ID 精确回放（服务端接受显式 ID）。 */
+  const sendStructureTransition = useCallback(
+    (target: HistoryEntry, mode: "undo" | "redo") => {
+      const before = stateRef.current;
+      const ops = [
+        ...structureDeltas(before.rowIds, target.rowIds, "row"),
+        ...structureDeltas(before.colIds, target.colIds, "col"),
+      ];
+      if (!ops.length) return;
+      structureGuardRef.current = { kind: mode, remaining: ops.length };
+      for (const op of ops) {
+        const msg: WsMessage = { type: op.type, client_id: localId, version: bump() };
+        if (op.type === "row_insert" || op.type === "col_insert") {
+          counterRef.current += 1;
+          msg.counter = counterRef.current;
+          msg.at = op.at;
+        }
+        msg.element_id = op.element_id;
+        send(msg);
       }
-    }
-    return updates;
-  }, []);
+    },
+    [bump, localId, send],
+  );
 
+  /** 把格式差异写回服务端（按传入元素 ID 定位，撤销/重做时结构可能已变化）。 */
+  const sendFormatTargets = useCallback(
+    (updates: Record<string, CellFormat | null>, ids: HistoryEntry) => {
+      const sheetId = stateRef.current.sheetId;
+      for (const [key, format] of Object.entries(updates)) {
+        const [row, col] = key.split(":").map(Number);
+        const rowId = ids.rowIds[row];
+        const colId = ids.colIds[col];
+        if (!rowId || !colId) continue;
+        dispatch({ type: "LOCAL_FORMAT", row, col, format: format ?? null, record: false });
+        const version = bump();
+        send({
+          type: "cell_format",
+          row,
+          col,
+          row_id: rowId,
+          col_id: colId,
+          format: format ?? null,
+          client_id: localId,
+          version,
+        });
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+          if (sheetId) {
+            api
+              .updateFormats(sheetId, [{ row_id: rowId, col_id: colId, format: format ?? null }], version)
+              .catch((err) => notify(String(err.message ?? err)));
+          }
+        }
+      }
+    },
+    [bump, localId, notify, send],
+  );
+
+  /**
+   * 撤销：恢复到上一个操作前的快照。
+   * - 纯值/格式操作：本地回滚 + 差异写回（不再压栈）；
+   * - 结构操作：回放逆操作（元素 ID 精确恢复，评论等锚点不会失效），
+   *   结构回执到达期间保留撤销栈（structureGuardRef）。
+   */
   const undo = useCallback(() => {
-    const { history } = stateRef.current;
-    if (!history.length) return;
-    const updates = restoreTargets(history[history.length - 1]);
+    const before = stateRef.current;
+    const entry = before.history[before.history.length - 1];
+    if (!entry) return;
+    const hasStructure =
+      entry.rows !== before.rows ||
+      entry.cols !== before.cols ||
+      !sameIds(entry.rowIds, before.rowIds) ||
+      !sameIds(entry.colIds, before.colIds);
     dispatch({ type: "UNDO" });
-    // 回写不再压栈，避免撤销本身又被记录成一次可撤销的操作
-    if (Object.keys(updates).length) applyCellMap(updates, false);
-  }, [applyCellMap, restoreTargets]);
+    if (!hasStructure) {
+      const cells = diffCells(before.cells, entry.cells);
+      if (Object.keys(cells).length) applyCellMap(cells, false);
+      const formats = diffFormats(before.formats, entry.formats);
+      if (Object.keys(formats).length) sendFormatTargets(formats, entry);
+      return;
+    }
+    // 结构差异：结构操作先发（回执带权威投影），单元格/格式差异随后按目标元素 ID 写回。
+    const payload: api.CellTarget[] = [];
+    const keys: string[] = [];
+    for (const [key, value] of Object.entries(diffCells(before.cells, entry.cells))) {
+      const [row, col] = key.split(":").map(Number);
+      payload.push({ row_id: entry.rowIds[row], col_id: entry.colIds[col], value });
+      keys.push(`${row}:${col}:${value === null ? "" : value}`);
+    }
+    sendStructureTransition(entry, "undo");
+    if (payload.length) sendCellTargets(payload, keys, before.sheetId);
+    const formats = diffFormats(before.formats, entry.formats);
+    if (Object.keys(formats).length) sendFormatTargets(formats, entry);
+  }, [applyCellMap, sendCellTargets, sendFormatTargets, sendStructureTransition]);
 
   const redo = useCallback(() => {
-    const { future } = stateRef.current;
-    if (!future.length) return;
-    const updates = restoreTargets(future[future.length - 1]);
+    const before = stateRef.current;
+    const entry = before.future[before.future.length - 1];
+    if (!entry) return;
+    const hasStructure =
+      entry.rows !== before.rows ||
+      entry.cols !== before.cols ||
+      !sameIds(entry.rowIds, before.rowIds) ||
+      !sameIds(entry.colIds, before.colIds);
     dispatch({ type: "REDO" });
-    if (Object.keys(updates).length) applyCellMap(updates, false);
-  }, [applyCellMap, restoreTargets]);
+    if (!hasStructure) {
+      const cells = diffCells(before.cells, entry.cells);
+      if (Object.keys(cells).length) applyCellMap(cells, false);
+      const formats = diffFormats(before.formats, entry.formats);
+      if (Object.keys(formats).length) sendFormatTargets(formats, entry);
+      return;
+    }
+    const payload: api.CellTarget[] = [];
+    const keys: string[] = [];
+    for (const [key, value] of Object.entries(diffCells(before.cells, entry.cells))) {
+      const [row, col] = key.split(":").map(Number);
+      payload.push({ row_id: entry.rowIds[row], col_id: entry.colIds[col], value });
+      keys.push(`${row}:${col}:${value === null ? "" : value}`);
+    }
+    sendStructureTransition(entry, "redo");
+    if (payload.length) sendCellTargets(payload, keys, before.sheetId);
+    const formats = diffFormats(before.formats, entry.formats);
+    if (Object.keys(formats).length) sendFormatTargets(formats, entry);
+  }, [applyCellMap, sendCellTargets, sendFormatTargets, sendStructureTransition]);
 
   const freeze = useCallback(() => {
     const { selected } = stateRef.current;
@@ -769,6 +1081,9 @@ export function useSheet(
     canUndo: state.history.length > 0,
     canRedo: state.future.length > 0,
     select,
+    extendSelect,
+    selectAll,
+    clearRange,
     startEdit,
     setDraft,
     cancelEdit,

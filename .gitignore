@@ -3,7 +3,8 @@ dist/
 __pycache__/
 *.pyc
 .venv/
-backend/data.db
+# SQLite 数据库及其侧车文件（-wal/-shm）与手工备份，只属于本地运行态
+backend/data.db*
 .DS_Store
 
 # 端到端验证脚本输出的截图（由 scripts/verify-ui.py 生成）
