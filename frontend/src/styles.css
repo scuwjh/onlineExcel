@@ -611,6 +611,17 @@ select {
   pointer-events: auto;
 }
 
+/* 冻结层（左列 / 顶行 / 左上角）里的单元格同样要可点击：
+   基类 .grid-row 设置了 pointer-events: none，这里必须显式恢复 */
+.grid-frozen-cols .cell,
+.grid-frozen-cols .row-head,
+.grid-frozen-rows .cell,
+.grid-frozen-rows .row-head,
+.grid-frozen-corner .cell,
+.grid-frozen-corner .row-head {
+  pointer-events: auto;
+}
+
 /* 行：文档坐标系（top 由行号决定，原点为表体左上角），行内用 flex 流式排布，
    单元格位置即 DOM 顺序，无需逐格写绝对坐标 */
 .grid-row {
