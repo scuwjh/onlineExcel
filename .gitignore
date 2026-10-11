@@ -9,3 +9,6 @@ backend/data.db*
 
 # 端到端验证脚本输出的截图（由 scripts/verify-ui.py 生成）
 scripts/artifacts/
+
+# 前端单测脚本的 esbuild 产物目录（旧版硬编码 "/tmp"，在 Windows 上会落到这里）
+frontend/tmp/
