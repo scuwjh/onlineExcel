@@ -2,14 +2,72 @@
 
 export type Cells = Record<string, string | null>;
 
+/** 数字格式（REQ-007）：决定单元格的展示方式，不影响存储的原始值。 */
+export type NumberFormat =
+  | "general"
+  | "number"
+  | "integer"
+  | "percent"
+  | "currency"
+  | "date"
+  | "text";
+
+/** 边框（REQ-007）：选中单元格时四边可独立开关。 */
+export interface CellBorders {
+  top?: boolean;
+  right?: boolean;
+  bottom?: boolean;
+  left?: boolean;
+}
+
 export interface CellFormat {
   bold?: boolean;
   italic?: boolean;
   underline?: boolean;
+  strike?: boolean;
+  /** 文字颜色（#rrggbb） */
   color?: string;
+  /** 背景色（#rrggbb） */
   bg?: string;
   align?: "left" | "center" | "right";
+  /** 垂直对齐 */
+  valign?: "top" | "middle" | "bottom";
+  /** 自动换行 */
+  wrap?: boolean;
+  /** 字体族 */
+  font?: string;
+  /** 字号（pt），范围 8–72 */
+  size?: number;
+  /** 数字/日期格式 */
+  numFmt?: NumberFormat;
+  /** 边框 */
+  borders?: CellBorders;
 }
+
+/** 可用的字体族（浏览器端不一定都装了，按系统回退）。 */
+export const FONT_FAMILIES = [
+  "系统默认",
+  "微软雅黑",
+  "宋体",
+  "黑体",
+  "楷体",
+  "Arial",
+  "Times New Roman",
+  "Consolas",
+] as const;
+
+export const FONT_SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48, 72] as const;
+
+export const NUMBER_FORMAT_LABELS: Record<NumberFormat, string> = {
+  general: "常规",
+  number: "数值（千分位）",
+  integer: "整数",
+  percent: "百分比",
+  currency: "货币 ¥",
+  date: "日期",
+  text: "文本",
+};
+
 
 /** 角色：owner > editor > commenter > viewer */
 export type Role = "owner" | "editor" | "commenter" | "viewer";
@@ -114,6 +172,16 @@ export interface ColumnFilter {
   value?: string;
 }
 
+/**
+ * 按值多选筛选（REQ-101）：勾选该列要保留的值。
+ * 与条件筛选（``ColumnFilter``）叠加生效（都是「并且」关系）。
+ */
+export interface ValueFilter {
+  col: number;
+  /** 勾选保留的值（原始文本；空单元格用 ``""`` 表示） */
+  values: string[];
+}
+
 export interface SortRule {
   col: number;
   dir: "asc" | "desc";
@@ -122,7 +190,10 @@ export interface SortRule {
 /** 视图状态：筛选与排序都只影响本端展示，不改动存储的数据顺序。 */
 export interface ViewState {
   filters: ColumnFilter[];
-  sort: SortRule | null;
+  /** 按值多选筛选 */
+  valueFilters: ValueFilter[];
+  /** 多级排序：按数组顺序依次比较 */
+  sorts: SortRule[];
 }
 
 export const FILTER_LABELS: Record<FilterOp, string> = {

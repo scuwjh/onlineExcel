@@ -13,6 +13,8 @@ import type { CellFormat, Cells, Cursor } from "../types";
 import { COL_W, HEADER_H, ROW_H, ROW_HEAD_W } from "../types";
 import { cellKey, colLabel } from "../lib/gridUtils";
 import { evaluate } from "../lib/formula";
+import { formatCellDisplay } from "../lib/cellDisplay";
+import type { SelectionKind } from "../hooks/useSheet";
 
 interface Props {
   cells: Cells;
@@ -22,6 +24,8 @@ interface Props {
   selected: { row: number; col: number };
   /** 框选锚点（Shift+方向键扩展选区时保持不变）。 */
   anchor: { row: number; col: number };
+  /** 选区类型：普通框选 / 整行 / 整列 / 全选（REQ-002/003）。 */
+  selectionKind: SelectionKind;
   editing: { row: number; col: number } | null;
   draft: string;
   cursors: Record<string, Cursor>;
@@ -34,6 +38,12 @@ interface Props {
   onExtendSelect: (row: number, col: number) => void;
   /** Ctrl+A：全选。 */
   onSelectAll: () => void;
+  /** 点行号：整行选中；Shift 时为连续多行。 */
+  onSelectRow: (row: number, extend?: boolean) => void;
+  /** 点列标：整列选中；Shift 时为连续多列。 */
+  onSelectCol: (col: number, extend?: boolean) => void;
+  /** 选区尺寸变化（用于状态栏显示"4×3"）。 */
+  onRangeInfoChange?: (info: { rows: number; cols: number; kind: SelectionKind }) => void;
   /** Delete/Backspace：清空选区。 */
   onClearRange: (r0: number, c0: number, r1: number, c1: number) => void;
   onStartEdit: (row: number, col: number, draft: string) => void;
@@ -77,6 +87,7 @@ export default function Grid(props: Props) {
     cols,
     selected,
     anchor,
+    selectionKind,
     editing,
     draft,
     cursors,
@@ -86,14 +97,32 @@ export default function Grid(props: Props) {
     readOnly,
   } = props;
 
-  /** 当前选区（锚点与活动格之间的矩形；单格时缩成一个点）。 */
+  /** 当前选区（锚点与活动格之间的矩形；整行整列时按类型展开）。 */
   const range = useMemo(() => {
-    const r0 = Math.min(selected.row, anchor.row);
-    const r1 = Math.max(selected.row, anchor.row);
-    const c0 = Math.min(selected.col, anchor.col);
-    const c1 = Math.max(selected.col, anchor.col);
-    return { r0, r1, c0, c1 };
-  }, [selected, anchor]);
+    if (selectionKind === "all") return { r0: 0, c0: 0, r1: Math.max(0, rows - 1), c1: Math.max(0, cols - 1) };
+    if (selectionKind === "row") {
+      return {
+        r0: Math.min(selected.row, anchor.row),
+        r1: Math.max(selected.row, anchor.row),
+        c0: 0,
+        c1: Math.max(0, cols - 1),
+      };
+    }
+    if (selectionKind === "col") {
+      return {
+        r0: 0,
+        r1: Math.max(0, rows - 1),
+        c0: Math.min(selected.col, anchor.col),
+        c1: Math.max(selected.col, anchor.col),
+      };
+    }
+    return {
+      r0: Math.min(selected.row, anchor.row),
+      r1: Math.max(selected.row, anchor.row),
+      c0: Math.min(selected.col, anchor.col),
+      c1: Math.max(selected.col, anchor.col),
+    };
+  }, [selected, anchor, selectionKind, rows, cols]);
   const inRange = useCallback(
     (r: number, c: number) => r >= range.r0 && r <= range.r1 && c >= range.c0 && c <= range.c1,
     [range],
@@ -347,8 +376,135 @@ export default function Grid(props: Props) {
     return { row, col };
   }, []);
 
+  /**
+   * 鼠标拖拽框选（REQ-002）。
+   *
+   * 拖拽期间只能看到"当前可见行"，所以按**展示顺序**换算：
+   * 单元格用真实数据行号，行号/列标用序号。
+   */
+  const dragRef = useRef<
+    | { mode: "cell"; anchor: { row: number; col: number } }
+    | { mode: "row"; from: number }
+    | { mode: "col"; from: number }
+    | null
+  >(null);
+  /** 本次按下是否真的拖动过（决定 click 是否再选中一次）。 */
+  const dragMovedRef = useRef(false);
+
+  const rowFromEvent = useCallback((e: React.MouseEvent): number | null => {
+    const head = (e.target as HTMLElement).closest("[data-row-head]") as HTMLElement | null;
+    if (!head) return null;
+    const row = Number(head.dataset.rowHead);
+    return Number.isNaN(row) ? null : row;
+  }, []);
+
+  const colFromEvent = useCallback((e: React.MouseEvent): number | null => {
+    const head = (e.target as HTMLElement).closest("[data-col-head]") as HTMLElement | null;
+    if (!head) return null;
+    const col = Number(head.dataset.colHead);
+    return Number.isNaN(col) ? null : col;
+  }, []);
+
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      if (e.button !== 0) return;
+      const rowHead = rowFromEvent(e);
+      if (rowHead !== null) {
+        e.preventDefault();
+        dragRef.current = { mode: "row", from: rowHead };
+        props.onSelectRow(rowHead, e.shiftKey);
+        focusShell();
+        return;
+      }
+      const colHead = colFromEvent(e);
+      if (colHead !== null) {
+        e.preventDefault();
+        dragRef.current = { mode: "col", from: colHead };
+        props.onSelectCol(colHead, e.shiftKey);
+        focusShell();
+        return;
+      }
+      const pos = cellFromEvent(e);
+      if (pos) {
+        // 单击立即选中并把锚点移到该格；拖拽时由 mousemove 走扩展选中，
+        // 松手后的 click 不再重复选中（否则会把刚框出来的选区收成单格）。
+        dragRef.current = { mode: "cell", anchor: pos };
+        dragMovedRef.current = false;
+        props.onSelect(pos.row, pos.col);
+      }
+    },
+    [cellFromEvent, colFromEvent, focusShell, props, rowFromEvent, selected.col, selected.row],
+  );
+
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent) => {
+      const drag = dragRef.current;
+      if (!drag) return;
+      if (drag.mode === "cell") {
+        const pos = cellFromEvent(e);
+        if (!pos) return;
+        if (pos.row === selected.row && pos.col === selected.col) return;
+        dragMovedRef.current = true;
+        props.onExtendSelect(pos.row, pos.col);
+        // 拖到边缘时自动滚动
+        const el = scrollRef.current;
+        if (el) {
+          const rect = el.getBoundingClientRect();
+          const margin = ROW_H;
+          if (e.clientY > rect.bottom - margin) el.scrollTop += ROW_H;
+          else if (e.clientY < rect.top + margin) el.scrollTop -= ROW_H;
+          if (e.clientX > rect.right - margin) el.scrollLeft += COL_W;
+          else if (e.clientX < rect.left + margin) el.scrollLeft -= COL_W;
+        }
+        return;
+      }
+      if (drag.mode === "row") {
+        const row = rowFromEvent(e);
+        if (row !== null && row !== selected.row) props.onSelectRow(row, true);
+        return;
+      }
+      const col = colFromEvent(e);
+      if (col !== null && col !== selected.col) props.onSelectCol(col, true);
+    },
+    [cellFromEvent, colFromEvent, props, rowFromEvent, selected.col, selected.row],
+  );
+
+  const endDrag = useCallback(() => {
+    dragRef.current = null;
+  }, []);
+
+  // 拖拽在表格外结束（或鼠标离开窗口）时也要收尾
+  useEffect(() => {
+    const stop = () => {
+      dragRef.current = null;
+    };
+    window.addEventListener("mouseup", stop);
+    return () => window.removeEventListener("mouseup", stop);
+  }, []);
+
+  // 把选区尺寸告诉父组件（状态栏显示）
+  useEffect(() => {
+    props.onRangeInfoChange?.({
+      rows: range.r1 - range.r0 + 1,
+      cols: range.c1 - range.c0 + 1,
+      kind: selectionKind,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [range.r0, range.r1, range.c0, range.c1, selectionKind]);
+
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
+      // 刚结束拖拽框选：不再把选区收成单格
+      if (dragMovedRef.current) {
+        dragMovedRef.current = false;
+        return;
+      }
+      // 行号/列标/左上角已在自己的 mousedown 里选中，click 不能再按单格处理，
+      // 否则会把刚选中的整行/整列收成一个单元格（历史 bug）。
+      const target = e.target as HTMLElement;
+      if (target.closest("[data-row-head]") || target.closest("[data-col-head]") || target.closest(".corner")) {
+        return;
+      }
       const pos = cellFromEvent(e);
       if (!pos) return;
       props.onSelect(pos.row, pos.col);
@@ -438,7 +594,7 @@ export default function Grid(props: Props) {
   );
 
   /**
-   * 单元格样式：只负责外观与冻结列的横向固定。
+   * 单元格样式：负责外观与冻结列的横向固定（REQ-007）。
    *
    * 纵向位置由"行"决定（行绝对定位在文档坐标，行内用 flex 流式排布）——
    * 曾经给每个单元格写绝对坐标，结果与行偏移叠加，数据只落在偶数行。
@@ -451,10 +607,22 @@ export default function Grid(props: Props) {
     zIndex: frozenCol ? 30 : isSelected ? 6 : 1,
     fontWeight: fmt?.bold ? 700 : undefined,
     fontStyle: fmt?.italic ? "italic" : undefined,
-    textDecoration: fmt?.underline ? "underline" : undefined,
+    // 下划线与删除线可以同时存在
+    textDecoration:
+      [fmt?.underline ? "underline" : "", fmt?.strike ? "line-through" : ""].filter(Boolean).join(" ") || undefined,
     color: fmt?.color || undefined,
     backgroundColor: fmt?.bg || undefined,
     textAlign: fmt?.align || undefined,
+    fontFamily: fmt?.font ? `"${fmt.font}", "${fmt.font}", sans-serif` : undefined,
+    fontSize: fmt?.size ? `${fmt.size}px` : undefined,
+    whiteSpace: fmt?.wrap ? "pre-wrap" : undefined,
+    overflow: fmt?.wrap ? "hidden" : undefined,
+    justifyContent:
+      fmt?.valign === "top" ? "flex-start" : fmt?.valign === "bottom" ? "flex-end" : undefined,
+    borderTop: fmt?.borders?.top ? "1px solid #5b6b7c" : undefined,
+    borderRight: fmt?.borders?.right ? "1px solid #5b6b7c" : undefined,
+    borderBottom: fmt?.borders?.bottom ? "1px solid #5b6b7c" : undefined,
+    borderLeft: fmt?.borders?.left ? "1px solid #5b6b7c" : undefined,
   });
 
   /**
@@ -485,6 +653,7 @@ export default function Grid(props: Props) {
             col={c}
             value={cells[key] ?? null}
             style={cellStyle(formats[key], c < frozenCols, isSelected)}
+            fmt={formats[key]}
             className={`cell${c < frozenCols ? " frozen" : ""}${isSelected ? " selected" : isInRange ? " in-range" : ""}`}
             remote={remote}
             cells={cells}
@@ -531,27 +700,45 @@ export default function Grid(props: Props) {
 
   return (
     <div
-      className="grid-shell"
+      className={`grid-shell kind-${selectionKind}`}
       ref={shellRef}
       tabIndex={0}
       onKeyDown={handleKeyDown}
       onClick={handleClick}
       onDoubleClick={handleDoubleClick}
+      onMouseDown={handleMouseDown}
+      onMouseMove={handleMouseMove}
+      onMouseUp={endDrag}
+      onMouseLeave={endDrag}
       // 便于自动化测试断言当前虚拟窗口（不影响渲染）
       data-view={`${view.rowStart}-${view.rowEnd}:${view.colStart}-${view.colEnd}:${Math.round(view.scrollTop)}:${Math.round(view.scrollLeft)}`}
       data-rows={visibleRows.length}
       data-order={order ? order.slice(0, 12).join(",") : "none"}
+      data-range={`${range.r0}:${range.c0}-${range.r1}:${range.c1}`}
+      data-anchor={`${anchor.row}:${anchor.col}`}
+      data-selected={`${selected.row}:${selected.col}`}
+      data-selkind={`${selectionKind}|${typeof selectionKind}|${JSON.stringify(props.selectionKind)}`}
     >
       <div className="grid-scroll" ref={scrollRef} onScroll={measure}>
         <div className="grid-space" style={{ width: ROW_HEAD_W + bodyWidth, height: HEADER_H + bodyHeight }}>
           {/* 表头（sticky 顶部；只含非冻结列，冻结列头在左上/左侧层） */}
           <div className="grid-header" style={{ height: HEADER_H, width: ROW_HEAD_W + bodyWidth }}>
-            {/* 左上角（行号列与表头交汇处）：横向滚动时钉在左缘 */}
-            <div className="corner" />
+            {/* 左上角（行号列与表头交汇处）：横向滚动时钉在左缘；点击=全选 */}
+            <div
+              className={`corner${selectionKind === "all" ? " active" : ""}`}
+              title="全选（Ctrl+A）"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                props.onSelectAll();
+                focusShell();
+              }}
+            />
             {leftPad > 0 && <div className="grid-spacer" style={{ width: leftPad }} />}
             {scrolledCols.map((c) => (
               <div
                 key={`h-${c}`}
+                data-col-head={c}
+                title={`选中 ${colLabel(c)} 列`}
                 className={`col-head${c >= range.c0 && c <= range.c1 ? " active" : ""}`}
                 style={{ flex: "none", zIndex: 40 }}
               >
@@ -576,7 +763,15 @@ export default function Grid(props: Props) {
                   style={{ top: slot * ROW_H, height: ROW_H, width: ROW_HEAD_W + bodyWidth }}
                 >
                   {frozenCols === 0 ? (
-                    <div className={`row-head${r >= range.r0 && r <= range.r1 ? " active" : ""}`}>{r + 1}</div>
+                    <div
+                      data-row-head={r}
+                      title={`选中第 ${r + 1} 行`}
+                      // 强调色只给"真正在选区内的行号"：原先按 selectionKind 判断，
+                      // 该条件对所有行都成立，等于把整列行号都刷成选中态（无法区分选了哪几行）
+                      className={`row-head${r >= range.r0 && r <= range.r1 ? " active" : ""}`}
+                    >
+                      {r + 1}
+                    </div>
                   ) : (
                     <div className="grid-spacer" style={{ width: ROW_HEAD_W }} />
                   )}
@@ -606,6 +801,8 @@ export default function Grid(props: Props) {
                 {frozenColList.map((c) => (
                   <div
                     key={`fch-${c}`}
+                    data-col-head={c}
+                    title={`选中 ${colLabel(c)} 列`}
                     className={`col-head frozen${c >= range.c0 && c <= range.c1 ? " active" : ""}`}
                     style={{ flex: "none" }}
                   >
@@ -627,7 +824,13 @@ export default function Grid(props: Props) {
                       width: frozenColsW,
                     }}
                   >
-                    <div className={`row-head frozen${r >= range.r0 && r <= range.r1 ? " active" : ""}`}>{r + 1}</div>
+                    <div
+                      data-row-head={r}
+                      title={`选中第 ${r + 1} 行`}
+                      className={`row-head frozen${r >= range.r0 && r <= range.r1 ? " active" : ""}`}
+                    >
+                      {r + 1}
+                    </div>
                     {renderCells(r, frozenColList, 0)}
                   </div>
                 );
@@ -652,7 +855,13 @@ export default function Grid(props: Props) {
                   className="grid-row"
                   style={{ top: r * ROW_H, height: ROW_H, width: ROW_HEAD_W + bodyWidth }}
                 >
-                  <div className={`row-head frozen${r >= range.r0 && r <= range.r1 ? " active" : ""}`}>{r + 1}</div>
+                  <div
+                    data-row-head={r}
+                    title={`选中第 ${r + 1} 行`}
+                    className={`row-head frozen${r >= range.r0 && r <= range.r1 ? " active" : ""}`}
+                  >
+                    {r + 1}
+                  </div>
                   {/* 让出冻结列宽度，与滚动区非冻结列对齐 */}
                   {frozenCols > 0 && <div className="grid-spacer" style={{ width: frozenCols * COL_W }} />}
                   {renderCells(r, scrolledCols, leftPad)}
@@ -679,7 +888,13 @@ export default function Grid(props: Props) {
                   className="grid-row"
                   style={{ top: r * ROW_H, height: ROW_H, width: frozenColsW }}
                 >
-                  <div className={`row-head frozen${r >= range.r0 && r <= range.r1 ? " active" : ""}`}>{r + 1}</div>
+                  <div
+                    data-row-head={r}
+                    title={`选中第 ${r + 1} 行`}
+                    className={`row-head frozen${r >= range.r0 && r <= range.r1 ? " active" : ""}`}
+                  >
+                    {r + 1}
+                  </div>
                   {renderCells(r, frozenColList, 0)}
                 </div>
               ))}
@@ -691,7 +906,8 @@ export default function Grid(props: Props) {
       </div>
       <div className="grid-status">
         <span>
-          选中 {colLabel(range.c0)}
+          {selectionKind === "all" ? "全选 " : selectionKind === "row" ? "整行 " : selectionKind === "col" ? "整列 " : "选中 "}
+          {colLabel(range.c0)}
           {range.r0 + 1}
           {range.r1 > range.r0 || range.c1 > range.c0
             ? ` : ${colLabel(range.c1)}${range.r1 + 1}（${range.r1 - range.r0 + 1}行 × ${range.c1 - range.c0 + 1}列）`
@@ -721,10 +937,12 @@ interface CellProps {
 }
 
 function GridCell(props: CellProps) {
-  const { row, col, value, style, className, remote, commentCount = 0 } = props;
+  const { row, col, value, fmt, style, className, remote, commentCount = 0 } = props;
   const title = [remote ? "其他用户正在此处" : "", commentCount ? `${commentCount} 条评论` : ""]
     .filter(Boolean)
     .join(" · ");
+  // 求值（公式）后再按数字/日期格式渲染；原始值始终不变（REQ-007/009）
+  const text = formatCellDisplay(evaluate(value, props.cells), fmt);
   return (
     <div
       data-cell="1"
@@ -735,7 +953,7 @@ function GridCell(props: CellProps) {
       className={`${className}${remote ? " remote" : ""}${commentCount ? " has-comment" : ""}`}
       title={title || undefined}
     >
-      <span>{evaluate(value, props.cells)}</span>
+      <span>{text}</span>
       {commentCount > 0 && <i className="comment-badge" aria-label={`${commentCount} 条评论`} />}
     </div>
   );

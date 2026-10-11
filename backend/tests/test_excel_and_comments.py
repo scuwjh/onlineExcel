@@ -244,6 +244,62 @@ def test_xlsx_module_roundtrip_unit():
     assert parsed["formats"]["0:0"]["align"] == "right"
 
 
+def test_xlsx_export_maps_extended_formats():
+    """REQ-007 的新格式（字体/字号/边框/删除线/数字格式）要正确写进 xlsx 并可读回。"""
+    data = xlsx.export_workbook(
+        "扩展格式",
+        2,
+        2,
+        {"0:0": "项目", "0:1": "1234.5"},
+        {
+            "0:0": {"bold": True, "font": "微软雅黑", "size": 14, "borders": {"bottom": True}, "bg": "#eaf1fd"},
+            "0:1": {"numFmt": "currency", "strike": True},
+        },
+    )
+    book = load_workbook(io.BytesIO(data))
+    sheet = book.active
+    assert sheet["A1"].font.name == "微软雅黑"
+    assert sheet["A1"].font.size == 14
+    assert sheet["A1"].font.bold is True
+    assert sheet["A1"].border.bottom.style == "thin"
+    assert sheet["B1"].number_format == "¥#,##0.00"
+    assert sheet["B1"].font.strike is True
+    book.close()
+
+    # 再导入应把这些字段还原成前端认识的名字
+    parsed = xlsx.import_workbook(data)
+    assert parsed["formats"]["0:0"]["font"] == "微软雅黑"
+    assert parsed["formats"]["0:0"]["size"] == 14
+    assert parsed["formats"]["0:0"]["borders"]["bottom"] is True
+    assert parsed["formats"]["0:1"]["numFmt"] == "currency"
+    assert parsed["formats"]["0:1"]["strike"] is True
+
+
+def test_format_roundtrip_through_api(client, admin_headers, make_sheet):
+    """扩展格式经 REST 写入后能读回（后端不做字段白名单过滤）。"""
+    sheet_id = make_sheet(rows=3, cols=3)
+    fmt = {
+        "bold": True,
+        "strike": True,
+        "font": "宋体",
+        "size": 16,
+        "numFmt": "percent",
+        "borders": {"top": True, "left": True},
+        "align": "center",
+        "bg": "#fff2cc",
+    }
+    response = client.put(
+        f"/api/sheets/{sheet_id}/formats",
+        json={"updates": [{"row": 1, "col": 1, "format": fmt}]},
+        headers=admin_headers,
+    )
+    assert response.status_code == 200, response.text
+    stored = client.get(f"/api/sheets/{sheet_id}", headers=admin_headers).json()["data"]["formats"]["1:1"]
+    assert stored == fmt
+    # 只写格式不产生值
+    assert client.get(f"/api/sheets/{sheet_id}", headers=admin_headers).json()["data"]["cells"] == {}
+
+
 def test_xlsx_rejects_oversize_file(monkeypatch):
     from app import config
 

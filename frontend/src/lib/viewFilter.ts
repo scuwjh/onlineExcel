@@ -3,14 +3,17 @@
  *
  * 语义边界（刻意如此，避免把"视图"变成"数据变更"）：
  * - **筛选**：纯本地视图，只隐藏行，不改动任何数据，也不广播；
- * - **排序**：同样是**展示层重排**（把行按某列重新排列显示），不写入存储顺序，
- *   因此不需要协同冲突处理；清除排序即可恢复原始行序。
+ *   支持两类条件，二者叠加（都是「并且」）：
+ *   1. 条件表达式（包含/等于/大于…，见 `ColumnFilter`）；
+ *   2. 按值多选（勾选该列要保留的值，见 `ValueFilter`，对应"筛选清单"交互）。
+ * - **排序**：同样是**展示层重排**，支持多级排序（先按第一列，相同再按第二列…），
+ *   不写入存储顺序，因此不需要协同冲突处理；清除排序即可恢复原始行序。
  *
  * 取值时会像网格一样对公式求值，因此可以按计算结果筛选/排序。
  */
 import { cellKey } from "./gridUtils";
 import { evaluate } from "./formula";
-import type { Cells, ColumnFilter, FilterOp, SortRule } from "../types";
+import type { Cells, ColumnFilter, FilterOp, SortRule, ValueFilter } from "../types";
 import { FILTERS_WITHOUT_VALUE } from "../types";
 
 function valueOf(cells: Cells, row: number, col: number): string {
@@ -38,7 +41,7 @@ function compareText(a: string, b: string): number {
   const emptyB = b.trim() === "";
   if (emptyA || emptyB) {
     if (emptyA && emptyB) return 0;
-    return emptyA ? 1 : -1; // 空值恒在后（方向由调用方乘以 dir，见下）
+    return emptyA ? 1 : -1;
   }
   const na = asNumber(a);
   const nb = asNumber(b);
@@ -90,36 +93,62 @@ function matches(text: string, filter: ColumnFilter): boolean {
   return text.trim() !== "";
 }
 
-/** 计算「可见行」的展示顺序：先筛选，再按排序规则重排。
- *
- * 第 0 行视为**表头行**：恒在首位，既不参与排序，也不会被筛选隐藏
- * （与 Excel「我的数据包含标题」的直觉一致）。
+/** 按值多选：`values` 里放的是原始文本（空单元格记为空串）。 */
+function matchesValues(text: string, filter: ValueFilter): boolean {
+  return filter.values.includes(text);
+}
+
+/** 某列的全部去重值（按出现顺序，供"筛选清单"展示）。 */
+export function distinctValues(cells: Cells, rows: number, col: number, limit = 1000): string[] {
+  const seen = new Set<string>();
+  for (let r = 0; r < rows; r++) {
+    seen.add(valueOf(cells, r, col));
+    if (seen.size > limit) break;
+  }
+  return [...seen];
+}
+
+/** 某列每个值出现的行数（清单里显示计数）。 */
+export function valueCounts(cells: Cells, rows: number, col: number): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (let r = 0; r < rows; r++) {
+    const text = valueOf(cells, r, col);
+    counts.set(text, (counts.get(text) ?? 0) + 1);
+  }
+  return counts;
+}
+
+/**
+ * 计算「可见行」的展示顺序：先筛选（条件 + 按值），再按排序规则多级重排。
  */
 export function computeRowOrder(
   rows: number,
   cells: Cells,
   filters: ColumnFilter[],
-  sort: SortRule | null,
+  valueFilters: ValueFilter[],
+  sorts: SortRule[],
 ): number[] {
-  const HEADER_ROW = 0;
   let order: number[] = [];
-  for (let r = 0; r < rows; r++) {
-    if (r === HEADER_ROW) continue;
-    order.push(r);
-  }
+  for (let r = 0; r < rows; r++) order.push(r);
 
   if (filters.length) {
     order = order.filter((r) => filters.every((f) => matches(valueOf(cells, r, f.col), f)));
   }
+  if (valueFilters.length) {
+    order = order.filter((r) => valueFilters.every((f) => matchesValues(valueOf(cells, r, f.col), f)));
+  }
 
-  if (sort) {
-    const dir = sort.dir === "asc" ? 1 : -1;
+  if (sorts.length) {
     order = [...order].sort((a, b) => {
-      const diff = compareForSort(valueOf(cells, a, sort.col), valueOf(cells, b, sort.col), dir);
-      return diff !== 0 ? diff : a - b; // 同值保持稳定（按原行号）
+      for (const rule of sorts) {
+        const dir = rule.dir === "asc" ? 1 : -1;
+        const diff = compareForSort(valueOf(cells, a, rule.col), valueOf(cells, b, rule.col), dir);
+        if (diff !== 0) return diff;
+      }
+      return a - b; // 全部相同：按原行号稳定排序
     });
   }
-  return [HEADER_ROW, ...order];
+  return order;
 }
 
 /** 该行是否因为筛选被隐藏（用于状态栏提示）。 */

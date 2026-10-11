@@ -16,7 +16,7 @@ import io
 from typing import Optional
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from . import config, crdt
@@ -51,6 +51,36 @@ def _fill(color: Optional[str]) -> Optional[PatternFill]:
     if len(hex_color) != 6:
         return None
     return PatternFill(start_color=hex_color.upper(), end_color=hex_color.upper(), fill_type="solid")
+
+
+def _hex(color: Optional[str]) -> Optional[str]:
+    if not isinstance(color, str):
+        return None
+    value = color.strip().lstrip("#")
+    return value.upper() if len(value) == 6 else None
+
+
+#: 内置数字格式（与前端 NUMBER_FORMAT_LABELS 对应）。
+_NUMBER_FORMATS = {
+    "general": "General",
+    "number": "#,##0.00",
+    "integer": "#,##0",
+    "percent": "0.00%",
+    "currency": '¥#,##0.00',
+    "date": "yyyy-mm-dd",
+    "text": "@",
+}
+
+
+def _borders(spec) -> Optional[Border]:
+    """把 ``{top,right,bottom,left}`` 布尔映射为 openpyxl 边框。"""
+    if not isinstance(spec, dict):
+        return None
+    thin = Side(style="thin", color="FF5B6B7C")
+    sides = {name: (thin if spec.get(name) else None) for name in ("top", "right", "bottom", "left")}
+    if not any(sides.values()):
+        return None
+    return Border(**sides)
 
 
 def export_workbook(
@@ -99,17 +129,35 @@ def export_workbook(
         target = ws.cell(row=row + 1, column=col + 1)
         bold = bool(fmt.get("bold"))
         italic = bool(fmt.get("italic"))
+        # 下划线与删除线可同时存在
         underline = "single" if fmt.get("underline") else None
-        color = fmt.get("color")
-        font_color = color.lstrip("#").upper() if isinstance(color, str) and len(color.strip("#")) == 6 else None
-        if bold or italic or underline or font_color:
-            target.font = Font(bold=bold, italic=italic, underline=underline, color=font_color)
+        strike = bool(fmt.get("strike"))
+        font_color = _hex(fmt.get("color"))
+        font_name = fmt.get("font") if isinstance(fmt.get("font"), str) and fmt.get("font") else None
+        size = fmt.get("size")
+        font_size = float(size) if isinstance(size, (int, float)) and 1 <= float(size) <= 409 else None
+        if bold or italic or underline or strike or font_color or font_name or font_size:
+            target.font = Font(
+                bold=bold,
+                italic=italic,
+                underline=underline,
+                strike=strike,
+                color=font_color,
+                name=font_name,
+                size=font_size,
+            )
         fill = _fill(fmt.get("bg"))
         if fill:
             target.fill = fill
         alignment = _alignment(fmt.get("align"))
         if alignment:
             target.alignment = alignment
+        borders = _borders(fmt.get("borders"))
+        if borders:
+            target.border = borders
+        num_fmt = fmt.get("numFmt")
+        if isinstance(num_fmt, str) and num_fmt in _NUMBER_FORMATS and num_fmt != "general":
+            target.number_format = _NUMBER_FORMATS[num_fmt]
 
     if frozen_rows or frozen_cols:
         ws.freeze_panes = ws.cell(row=frozen_rows + 1, column=frozen_cols + 1)
@@ -213,6 +261,10 @@ def _to_text(value) -> str:
     return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
 
+#: Excel 内置数字格式 → 前端的 numFmt 名称（导入时反向映射）。
+_REVERSE_NUMBER_FORMATS = {value: key for key, value in _NUMBER_FORMATS.items() if key != "general"}
+
+
 def _format_of(cell) -> Optional[dict]:
     fmt: dict = {}
     font = cell.font
@@ -223,9 +275,17 @@ def _format_of(cell) -> Optional[dict]:
             fmt["italic"] = True
         if font.underline:
             fmt["underline"] = True
+        if font.strike:
+            fmt["strike"] = True
         color = getattr(font.color, "rgb", None)
         if isinstance(color, str) and len(color) == 8 and color.upper() not in ("FF000000", "00000000"):
             fmt["color"] = f"#{color[2:].lower()}"
+        name = getattr(font, "name", None)
+        if isinstance(name, str) and name and name != "Calibri":
+            fmt["font"] = name
+        size = getattr(font, "size", None)
+        if isinstance(size, (int, float)) and size and float(size) != 11:
+            fmt["size"] = int(size)
     fill = cell.fill
     bg = getattr(getattr(fill, "fgColor", None), "rgb", None) if fill is not None else None
     if isinstance(bg, str) and len(bg) == 8 and bg.upper() not in ("00000000", "FFFFFFFF"):
@@ -233,4 +293,19 @@ def _format_of(cell) -> Optional[dict]:
     align = getattr(cell.alignment, "horizontal", None)
     if align in ("left", "center", "right"):
         fmt["align"] = align
+
+    # 边框：只记录"有边框"的方向
+    border = cell.border
+    if border is not None:
+        sides = {
+            side: bool(getattr(border, side, None) and getattr(border, side).style)
+            for side in ("top", "right", "bottom", "left")
+        }
+        if any(sides.values()):
+            fmt["borders"] = sides
+
+    # 数字格式：能映射回内置类型才记录（自定义格式保留原始串意义不大）
+    number_format = getattr(cell, "number_format", None)
+    if isinstance(number_format, str) and number_format in _REVERSE_NUMBER_FORMATS:
+        fmt["numFmt"] = _REVERSE_NUMBER_FORMATS[number_format]
     return fmt or None

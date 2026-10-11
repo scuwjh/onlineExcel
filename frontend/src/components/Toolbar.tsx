@@ -1,5 +1,6 @@
 import { useRef } from "react";
-import type { CellFormat, Role } from "../types";
+import type { CellBorders, CellFormat, NumberFormat, Role } from "../types";
+import { FONT_FAMILIES, FONT_SIZES, NUMBER_FORMAT_LABELS } from "../types";
 
 interface Props {
   canUndo: boolean;
@@ -10,9 +11,17 @@ interface Props {
   sheetName: string;
   role: Role | null;
   format: CellFormat;
-  onToggleStyle: (key: "bold" | "italic" | "underline") => void;
+  onToggleStyle: (key: "bold" | "italic" | "underline" | "strike") => void;
   onAlign: (align: "left" | "center" | "right") => void;
   onColor: (kind: "color" | "bg", color: string) => void;
+  /** 字体族 / 字号 / 数字格式 / 边框（REQ-007）。 */
+  onFont: (font: string) => void;
+  onFontSize: (size: number) => void;
+  onNumberFormat: (numFmt: NumberFormat) => void;
+  onBorders: (borders: CellBorders) => void;
+  onClearFormat: () => void;
+  /** 当前选区描述，例如 "4×3" 或 "整行 2 行"。 */
+  rangeLabel: string;
   onInsertRow: () => void;
   onDeleteRow: () => void;
   onInsertCol: () => void;
@@ -52,6 +61,33 @@ export default function Toolbar(props: Props) {
         ↷ 重做
       </button>
       <span className="divider" />
+      <select
+        className="fmt-select"
+        disabled={!editable}
+        value={f.font && FONT_FAMILIES.includes(f.font as (typeof FONT_FAMILIES)[number]) ? f.font : "系统默认"}
+        onChange={(e) => props.onFont(e.target.value)}
+        title="字体"
+      >
+        {FONT_FAMILIES.map((name) => (
+          <option key={name} value={name}>
+            {name}
+          </option>
+        ))}
+      </select>
+      <select
+        className="fmt-select size"
+        disabled={!editable}
+        value={f.size ?? 12}
+        onChange={(e) => props.onFontSize(Number(e.target.value))}
+        title="字号"
+      >
+        {FONT_SIZES.map((size) => (
+          <option key={size} value={size}>
+            {size}
+          </option>
+        ))}
+      </select>
+      <span className="divider" />
       <button className={f.bold ? "active" : ""} disabled={!editable} onClick={() => props.onToggleStyle("bold")} title="加粗">
         B
       </button>
@@ -65,6 +101,9 @@ export default function Toolbar(props: Props) {
         title="下划线"
       >
         U
+      </button>
+      <button className={f.strike ? "active" : ""} disabled={!editable} onClick={() => props.onToggleStyle("strike")} title="删除线">
+        S
       </button>
       <span className="divider" />
       <button className={f.align === "left" ? "active" : ""} disabled={!editable} onClick={() => props.onAlign("left")} title="左对齐">
@@ -89,6 +128,61 @@ export default function Toolbar(props: Props) {
         <input type="color" disabled={!editable} value={f.bg || "#ffffff"} onChange={(e) => props.onColor("bg", e.target.value)} />
         底色
       </label>
+      <span className="divider" />
+      {/* 边框：四个方向独立开关，作用于整个选区 */}
+      <span className="border-group" title="边框（作用于整个选区）">
+        {(
+          [
+            ["top", "上"],
+            ["right", "右"],
+            ["bottom", "下"],
+            ["left", "左"],
+          ] as Array<[keyof CellBorders, string]>
+        ).map(([side, label]) => (
+          <button
+            key={side}
+            className={f.borders?.[side] ? "active" : ""}
+            disabled={!editable}
+            onClick={() => props.onBorders({ ...(f.borders ?? {}), [side]: !f.borders?.[side] })}
+            title={`${label}边框`}
+          >
+            {label}
+          </button>
+        ))}
+        <button
+          disabled={!editable}
+          onClick={() => props.onBorders({ top: true, right: true, bottom: true, left: true })}
+          title="四边全加边框"
+        >
+          全
+        </button>
+        <button
+          disabled={!editable}
+          onClick={() => props.onBorders({ top: false, right: false, bottom: false, left: false })}
+          title="清除边框"
+        >
+          无
+        </button>
+      </span>
+      <select
+        className="fmt-select"
+        disabled={!editable}
+        value={f.numFmt ?? "general"}
+        onChange={(e) => props.onNumberFormat(e.target.value as NumberFormat)}
+        title="数字/日期格式（只影响显示，不改原始值）"
+      >
+        {(Object.keys(NUMBER_FORMAT_LABELS) as NumberFormat[]).map((key) => (
+          <option key={key} value={key}>
+            {NUMBER_FORMAT_LABELS[key]}
+          </option>
+        ))}
+      </select>
+      <button disabled={!editable} onClick={props.onClearFormat} title="清除选区格式">
+        清格式
+      </button>
+      <span className="range-label" title="当前选区">
+        {props.rangeLabel}
+      </span>
       <span className="divider" />
       <button onClick={props.onInsertRow} disabled={!editable} title="在选中行上方插入行">
         ＋行

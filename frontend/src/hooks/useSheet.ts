@@ -33,8 +33,10 @@ export interface HistoryEntry {
   colIds: string[];
 }
 
-export interface SheetState {
-  sheetId: string | null;
+/** 选区类型（REQ-002/003）。 */
+export type SelectionKind = "cell" | "row" | "col" | "all";
+
+export interface SheetState {  sheetId: string | null;
   sheetName: string;
   role: Role | null;
   cells: Cells;
@@ -48,7 +50,17 @@ export interface SheetState {
   selected: CellPoint;
   /** 框选锚点：与 selected 一起构成选区（REQ-002/003）。 */
   anchor: CellPoint;
+  /**
+   * 选区类型（REQ-002/003）：
+   * - ``cell``：普通单元格/矩形框选；
+   * - ``row``：点行号选中的整行（可跨多行）；
+   * - ``col``：点列标选中的整列（可跨多列）；
+   * - ``all``：Ctrl+A 或点左上角的全选。
+   */
+  selectionKind: SelectionKind;
   editing: CellPoint | null;
+  /** 焦点在公式栏（REQ-009）：此时 draft 是唯一真相，网格不弹浮层。 */
+  formulaEditing: boolean;
   draft: string;
   users: Record<string, boolean>;
   cursors: Record<string, Cursor>;
@@ -66,7 +78,13 @@ type Action =
   | { type: "SELECT"; row: number; col: number }
   | { type: "SELECT_EXTEND"; row: number; col: number }
   | { type: "SELECT_ALL"; rows: number; cols: number }
+  | { type: "SELECT_ROW"; row: number; col: number }
+  | { type: "SELECT_COL"; row: number; col: number }
+  | { type: "SELECT_ROW_EXTEND"; from: number; to: number }
+  | { type: "SELECT_COL_EXTEND"; from: number; to: number }
   | { type: "START_EDIT"; row: number; col: number; draft: string }
+  /** 只在公式栏里编辑：改草稿但**不**打开网格的单元格编辑浮层。 */
+  | { type: "START_FORMULA"; row: number; col: number; draft: string }
   | { type: "SET_DRAFT"; draft: string }
   | { type: "CANCEL_EDIT" }
   | { type: "LOCAL_CELL"; row: number; col: number; value: string | null; record?: boolean }
@@ -74,6 +92,11 @@ type Action =
   | { type: "REMOTE_CELL"; row: number; col: number; value: string | null; cells?: Cells; version?: number; seq?: number }
   | { type: "REMOTE_FORMAT"; row: number; col: number; format: CellFormat | null; formats?: Record<string, CellFormat> }
   | { type: "LOCAL_FORMAT"; row: number; col: number; format: CellFormat | null; record?: boolean }
+  | {
+      type: "LOCAL_FORMATS";
+      entries: Array<{ row: number; col: number; format: CellFormat | null }>;
+      record?: boolean;
+    }
   | {
       type: "REMOTE_STRUCTURE";
       cells?: Cells;
@@ -114,7 +137,9 @@ const initialState: SheetState = {
   seq: 0,
   selected: { row: 0, col: 0 },
   anchor: { row: 0, col: 0 },
+  selectionKind: "cell",
   editing: null,
+  formulaEditing: false,
   draft: "",
   users: {},
   cursors: {},
@@ -169,30 +194,90 @@ function reducer(state: SheetState, action: Action): SheetState {
         ...state,
         selected: { row: action.row, col: action.col },
         anchor: { row: action.row, col: action.col },
+        selectionKind: "cell",
         editing: null,
+        formulaEditing: false,
       };
     case "SELECT_EXTEND":
-      // Shift+方向键：移动活动格，但保持锚点不动 → 选区扩大/收缩
-      return { ...state, selected: { row: action.row, col: action.col }, editing: null };
+      // Shift+方向键：移动活动格，但保持锚点不动 → 选区扩大/收缩。
+      // 从"整行/整列"选区进入拖拽扩展时，退化为矩形选区（与 Excel 一致）。
+      return {
+        ...state,
+        selected: { row: action.row, col: action.col },
+        selectionKind: state.selectionKind === "all" ? "all" : "cell",
+        editing: null,
+        formulaEditing: false,
+      };
     case "SELECT_ALL":
       return {
         ...state,
         // 活动格放在右下角，锚点放在左上角 → 覆盖整张表
         selected: { row: Math.max(0, action.rows - 1), col: Math.max(0, action.cols - 1) },
         anchor: { row: 0, col: 0 },
+        selectionKind: "all",
         editing: null,
+        formulaEditing: false,
+      };
+    case "SELECT_ROW":
+      // 点行号：整行选中（锚点落在该行首列，活动格落在该行末列 → 整行）
+      return {
+        ...state,
+        selected: { row: action.row, col: Math.max(action.col, 0) },
+        anchor: { row: action.row, col: 0 },
+        selectionKind: "row",
+        editing: null,
+        formulaEditing: false,
+      };
+    case "SELECT_COL":
+      return {
+        ...state,
+        selected: { row: Math.max(action.row, 0), col: action.col },
+        anchor: { row: 0, col: action.col },
+        selectionKind: "col",
+        editing: null,
+        formulaEditing: false,
+      };
+    case "SELECT_ROW_EXTEND":
+      // Shift+点行号 / 拖动行号：连续整行
+      return {
+        ...state,
+        selected: { row: action.to, col: state.selected.col },
+        anchor: { row: action.from, col: 0 },
+        selectionKind: "row",
+        editing: null,
+        formulaEditing: false,
+      };
+    case "SELECT_COL_EXTEND":
+      return {
+        ...state,
+        selected: { row: state.selected.row, col: action.to },
+        anchor: { row: 0, col: action.from },
+        selectionKind: "col",
+        editing: null,
+        formulaEditing: false,
       };
     case "START_EDIT":
       return {
         ...state,
         selected: { row: action.row, col: action.col },
         editing: { row: action.row, col: action.col },
+        formulaEditing: false,
+        draft: action.draft,
+      };
+    case "START_FORMULA":
+      // 焦点在公式栏：不设置 editing（否则网格会再弹输入框抢焦点），
+      // 但要用 formulaEditing 让 rawValue 读到 draft。
+      return {
+        ...state,
+        selected: { row: action.row, col: action.col },
+        editing: null,
+        formulaEditing: true,
         draft: action.draft,
       };
     case "SET_DRAFT":
       return { ...state, draft: action.draft };
     case "CANCEL_EDIT":
-      return { ...state, editing: null };
+      return { ...state, editing: null, formulaEditing: false };
     case "LOCAL_CELL": {
       const key = cellKey(action.row, action.col);
       const record = action.record !== false;
@@ -200,6 +285,7 @@ function reducer(state: SheetState, action: Action): SheetState {
         ...state,
         cells: { ...state.cells, [key]: action.value },
         editing: null,
+        formulaEditing: false,
         history: record ? pushHistory(state, snapshotOf(state)) : state.history,
         future: record ? [] : state.future,
       };
@@ -240,6 +326,22 @@ function reducer(state: SheetState, action: Action): SheetState {
       const formats = { ...state.formats };
       if (action.format && Object.keys(action.format).length) formats[key] = action.format;
       else delete formats[key];
+      const record = action.record !== false;
+      return {
+        ...state,
+        formats,
+        history: record ? pushHistory(state, snapshotOf(state)) : state.history,
+        future: record ? [] : state.future,
+      };
+    }
+    case "LOCAL_FORMATS": {
+      // 选区批量套用格式：一次记录历史，整批可撤销
+      const formats = { ...state.formats };
+      for (const entry of action.entries) {
+        const key = cellKey(entry.row, entry.col);
+        if (entry.format && Object.keys(entry.format).length) formats[key] = entry.format;
+        else delete formats[key];
+      }
       const record = action.record !== false;
       return {
         ...state,
@@ -403,14 +505,25 @@ export interface UseSheetResult {
   extendSelect: (row: number, col: number) => void;
   /** Ctrl+A：全选。 */
   selectAll: () => void;
+  /** 点行号：整行选中（Shift 时为连续多行）。 */
+  selectRow: (row: number, extend?: boolean) => void;
+  /** 点列标：整列选中（Shift 时为连续多列）。 */
+  selectCol: (col: number, extend?: boolean) => void;
+  /** 当前选区（锚点与活动格之间的矩形）。 */
+  targetRange: () => { r0: number; c0: number; r1: number; c1: number };
   /** 清空选区内的所有单元格（Delete/Backspace）。 */
   clearRange: (r0: number, c0: number, r1: number, c1: number) => void;
   startEdit: (row: number, col: number, draft: string) => void;
+  /** 公式栏进入编辑态（不动网格浮层）。 */
+  startFormulaEdit: (row: number, col: number, draft: string) => void;
   setDraft: (draft: string) => void;
   cancelEdit: () => void;
   commitCell: (row: number, col: number, value: string) => void;
+  /** 把格式套用到当前选区（单元格/框选/整行整列/全选都支持）。 */
   applyFormat: (partial: Partial<CellFormat>) => void;
-  toggleStyle: (key: "bold" | "italic" | "underline") => void;
+  /** 清空当前选区的格式。 */
+  clearFormat: () => void;
+  toggleStyle: (key: "bold" | "italic" | "underline" | "strike") => void;
   pasteBlock: (row: number, col: number, text: string) => void;
   insertRow: () => void;
   deleteRow: () => void;
@@ -693,10 +806,64 @@ export function useSheet(
     dispatch({ type: "SELECT_ALL", rows, cols });
   }, []);
 
+  /** 当前选区矩形（整行/整列/全选时自动展开为对应的完整范围）。 */
+  const targetRange = useCallback(() => {
+    const { selected, anchor, rows, cols, selectionKind } = stateRef.current;
+    if (selectionKind === "all") return { r0: 0, c0: 0, r1: Math.max(0, rows - 1), c1: Math.max(0, cols - 1) };
+    if (selectionKind === "row") {
+      const r0 = Math.min(selected.row, anchor.row);
+      const r1 = Math.max(selected.row, anchor.row);
+      return { r0, c0: 0, r1, c1: Math.max(0, cols - 1) };
+    }
+    if (selectionKind === "col") {
+      const c0 = Math.min(selected.col, anchor.col);
+      const c1 = Math.max(selected.col, anchor.col);
+      return { r0: 0, c0, r1: Math.max(0, rows - 1), c1 };
+    }
+    return {
+      r0: Math.min(selected.row, anchor.row),
+      c0: Math.min(selected.col, anchor.col),
+      r1: Math.max(selected.row, anchor.row),
+      c1: Math.max(selected.col, anchor.col),
+    };
+  }, []);
+
+  /** 点行号/点列标：整行整列选中；Shift 时为连续多行/多列。 */
+  const selectRow = useCallback((row: number, extend = false) => {
+    const { rows, cols, anchor, selectionKind } = stateRef.current;
+    const target = Math.max(0, Math.min(rows - 1, row));
+    if (extend || selectionKind === "row") {
+      const from = selectionKind === "row" ? anchor.row : target;
+      dispatch({ type: "SELECT_ROW_EXTEND", from, to: target });
+    } else {
+      dispatch({ type: "SELECT_ROW", row: target, col: Math.max(0, cols - 1) });
+    }
+  }, []);
+
+  const selectCol = useCallback((col: number, extend = false) => {
+    const { rows, cols, anchor, selectionKind } = stateRef.current;
+    const target = Math.max(0, Math.min(cols - 1, col));
+    if (extend || selectionKind === "col") {
+      const from = selectionKind === "col" ? anchor.col : target;
+      dispatch({ type: "SELECT_COL_EXTEND", from, to: target });
+    } else {
+      dispatch({ type: "SELECT_COL", row: Math.max(0, rows - 1), col: target });
+    }
+  }, []);
+
   const startEdit = useCallback(
     (row: number, col: number, draft: string) => {
       if (!editable) return;
       dispatch({ type: "START_EDIT", row, col, draft });
+    },
+    [editable],
+  );
+
+  /** 公式栏获得焦点：只进入"公式编辑"状态，不打开网格浮层。 */
+  const startFormulaEdit = useCallback(
+    (row: number, col: number, draft: string) => {
+      if (!editable) return;
+      dispatch({ type: "START_FORMULA", row, col, draft });
     },
     [editable],
   );
@@ -844,30 +1011,83 @@ export function useSheet(
     [applyCellMap, editable],
   );
 
+  /**
+   * 把格式套用到**当前选区**（REQ-007）。
+   *
+   * 之前只作用于活动单元格，选区/整行整列选中时用户会以为"没生效"。
+   * 这里对选区内每个单元格合并 partial，一次记录历史、一次广播多条。
+   */
   const applyFormat = useCallback(
     (partial: Partial<CellFormat>) => {
       if (!editable) return;
-      const { selected, formats, rowIds, colIds } = stateRef.current;
-      const key = cellKey(selected.row, selected.col);
-      const next: CellFormat = { ...(formats[key] ?? {}), ...partial };
-      dispatch({ type: "LOCAL_FORMAT", row: selected.row, col: selected.col, format: next });
+      const { formats, rowIds, colIds } = stateRef.current;
+      const { r0, c0, r1, c1 } = targetRange();
+      const updates: Array<{ row: number; col: number; format: CellFormat }> = [];
+      for (let r = r0; r <= r1; r++) {
+        for (let c = c0; c <= c1; c++) {
+          const key = cellKey(r, c);
+          const next: CellFormat = { ...(formats[key] ?? {}), ...partial };
+          // 全空的格式对象视为"无格式"，避免存一堆空对象
+          const meaningful = Object.fromEntries(
+            Object.entries(next).filter(([, v]) => v !== undefined && v !== null && v !== false && v !== ""),
+          ) as CellFormat;
+          updates.push({ row: r, col: c, format: meaningful });
+        }
+      }
+      if (!updates.length) return;
+
+      // 一次性压入历史（整批可撤销）
+      const entries = updates.map((u) => ({ row: u.row, col: u.col, format: u.format }));
+      dispatch({ type: "LOCAL_FORMATS", entries });
+
       const version = bump();
+      for (const u of updates) {
+        send({
+          type: "cell_format",
+          row: u.row,
+          col: u.col,
+          row_id: rowIds[u.row],
+          col_id: colIds[u.col],
+          format: u.format,
+          client_id: localId,
+          version,
+        });
+      }
+    },
+    [bump, editable, localId, send, targetRange],
+  );
+
+  /** 清空当前选区的格式。 */
+  const clearFormat = useCallback(() => {
+    if (!editable) return;
+    const { formats, rowIds, colIds } = stateRef.current;
+    const { r0, c0, r1, c1 } = targetRange();
+    const entries: Array<{ row: number; col: number; format: CellFormat | null }> = [];
+    for (let r = r0; r <= r1; r++) {
+      for (let c = c0; c <= c1; c++) {
+        const key = cellKey(r, c);
+        if (formats[key]) entries.push({ row: r, col: c, format: null });
+      }
+    }
+    if (!entries.length) return;
+    dispatch({ type: "LOCAL_FORMATS", entries });
+    const version = bump();
+    for (const entry of entries) {
       send({
         type: "cell_format",
-        row: selected.row,
-        col: selected.col,
-        row_id: rowIds[selected.row],
-        col_id: colIds[selected.col],
-        format: next,
+        row: entry.row,
+        col: entry.col,
+        row_id: rowIds[entry.row],
+        col_id: colIds[entry.col],
+        format: null,
         client_id: localId,
         version,
       });
-    },
-    [bump, editable, localId, send],
-  );
+    }
+  }, [bump, editable, localId, send, targetRange]);
 
   const toggleStyle = useCallback(
-    (key: "bold" | "italic" | "underline") => {
+    (key: "bold" | "italic" | "underline" | "strike") => {
       const current =
         stateRef.current.formats[cellKey(stateRef.current.selected.row, stateRef.current.selected.col)] ?? {};
       applyFormat({ [key]: !current[key] } as Partial<CellFormat>);
@@ -1083,12 +1303,17 @@ export function useSheet(
     select,
     extendSelect,
     selectAll,
+    selectRow,
+    selectCol,
+    targetRange,
     clearRange,
     startEdit,
+    startFormulaEdit,
     setDraft,
     cancelEdit,
     commitCell,
     applyFormat,
+    clearFormat,
     toggleStyle,
     pasteBlock,
     insertRow,

@@ -273,10 +273,11 @@ async def main() -> int:
             await page.click('.view-panel button:has-text("全部清除")')
             await page.wait_for_timeout(1000)
 
-            sort_selects = page.locator(".view-panel .view-row select")
-            await sort_selects.nth(0).select_option("1")
-            await page.wait_for_timeout(400)
-            await sort_selects.nth(1).select_option("desc")
+            # 排序面板支持多级：先用"添加排序条件"下拉加入一条，再设置方向
+            await page.locator('.view-panel .view-row select').first.select_option("1")
+            await page.wait_for_timeout(500)
+            rule = page.locator(".filter-list .view-row").first
+            await rule.locator("select").nth(1).select_option("desc")
             await page.wait_for_timeout(1200)
             ordered = await page.evaluate(
                 """() => [...document.querySelectorAll('[data-cell][data-col="1"]')]

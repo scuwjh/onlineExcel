@@ -12,7 +12,8 @@ import { useComments } from "./hooks/useComments";
 import { useSheet } from "./hooks/useSheet";
 import { cellKey } from "./lib/gridUtils";
 import { computeRowOrder } from "./lib/viewFilter";
-import type { ColumnFilter, Role, SheetData, SheetSummary, SortRule } from "./types";
+import { evaluate } from "./lib/formula";
+import type { ColumnFilter, Role, SheetData, SheetSummary, SortRule, ValueFilter } from "./types";
 
 type Panel = "none" | "versions" | "permissions" | "comments" | "view";
 
@@ -26,7 +27,14 @@ export default function App() {
   const [appError, setAppError] = useState<string | null>(null);
   // 视图状态（本地）：筛选与排序都不改数据
   const [filters, setFilters] = useState<ColumnFilter[]>([]);
-  const [sort, setSort] = useState<SortRule | null>(null);
+  const [valueFilters, setValueFilters] = useState<ValueFilter[]>([]);
+  const [sorts, setSorts] = useState<SortRule[]>([]);
+  /** 当前选区尺寸（状态栏显示"选中 4×3"）。 */
+  const [rangeInfo, setRangeInfo] = useState<{ rows: number; cols: number; kind: string }>({
+    rows: 1,
+    cols: 1,
+    kind: "cell",
+  });
   const xlsxRef = useRef<HTMLInputElement>(null);
 
   const refreshList = useCallback(async () => {
@@ -134,19 +142,34 @@ export default function App() {
 
   const role: Role | null = sheetApi.state.role ?? sheet?.role ?? null;
   const selectedKey = cellKey(sheetApi.state.selected.row, sheetApi.state.selected.col);
-  const rawValue = sheetApi.state.editing
-    ? sheetApi.state.draft
-    : (sheetApi.state.cells[selectedKey] ?? "");
+  const rawValue =
+    sheetApi.state.editing || sheetApi.state.formulaEditing
+      ? sheetApi.state.draft
+      : (sheetApi.state.cells[selectedKey] ?? "");
   const selectedFormat = sheetApi.state.formats[selectedKey] ?? {};
+  /** 活动格的求值结果：公式栏用它显示"实时计算"结果与错误检查（REQ-009）。 */
+  const computedValue = useMemo(
+    () => evaluate(sheetApi.state.cells[selectedKey] ?? null, sheetApi.state.cells),
+    [sheetApi.state.cells, selectedKey],
+  );
 
   const mergedComments = comments;
   const canComment = role === "owner" || role === "editor" || role === "commenter";
 
-  // 视图（REQ-101）：筛选 + 排序都只影响本端展示
+  // 视图（REQ-101）：条件筛选 + 按值多选筛选 + 多级排序，都只影响本端展示
   const rowOrder = useMemo(() => {
-    if (!filters.length && !sort) return undefined;
-    return computeRowOrder(sheetApi.state.rows, sheetApi.state.cells, filters, sort);
-  }, [filters, sort, sheetApi.state.rows, sheetApi.state.cells]);
+    if (!filters.length && !valueFilters.length && !sorts.length) return undefined;
+    return computeRowOrder(sheetApi.state.rows, sheetApi.state.cells, filters, valueFilters, sorts);
+  }, [filters, valueFilters, sorts, sheetApi.state.rows, sheetApi.state.cells]);
+
+  /** 当前选区描述（工具栏显示，REQ-002/003 让用户确认选中的范围）。 */
+  const rangeLabel = useMemo(() => {
+    if (rangeInfo.kind === "all") return `全选 ${rangeInfo.rows}×${rangeInfo.cols}`;
+    if (rangeInfo.kind === "row") return `整行 ${rangeInfo.rows} 行`;
+    if (rangeInfo.kind === "col") return `整列 ${rangeInfo.cols} 列`;
+    if (rangeInfo.rows === 1 && rangeInfo.cols === 1) return "单格";
+    return `${rangeInfo.rows}×${rangeInfo.cols} 选区`;
+  }, [rangeInfo]);
 
   const notify = useMemo(() => (message: string) => setToast(message), []);
   useEffect(() => {
@@ -211,7 +234,8 @@ export default function App() {
         setSheet(await api.getSheet(sheetId));
         await refreshList();
         setFilters([]);
-        setSort(null);
+        setValueFilters([]);
+        setSorts([]);
         notify(
           `已从「${updated.sheet_name}」导入 ${updated.rows} 行 × ${updated.cols} 列` +
             (updated.skipped_long_cells ? `，跳过 ${updated.skipped_long_cells} 个超长单元格` : ""),
@@ -249,7 +273,8 @@ export default function App() {
       setSheets(rest);
       setSheet(rest.length ? await api.getSheet(rest[0].id) : null);
       setFilters([]);
-      setSort(null);
+      setValueFilters([]);
+      setSorts([]);
       notify(`已删除「${name}」`);
     } catch (err) {
       notify(String((err as Error).message ?? err));
@@ -279,6 +304,12 @@ export default function App() {
         onToggleStyle={sheetApi.toggleStyle}
         onAlign={(align) => sheetApi.applyFormat({ align })}
         onColor={(kind, color) => sheetApi.applyFormat(kind === "color" ? { color } : { bg: color })}
+        onFont={(font) => sheetApi.applyFormat({ font: font === "系统默认" ? "" : font })}
+        onFontSize={(size) => sheetApi.applyFormat({ size })}
+        onNumberFormat={(numFmt) => sheetApi.applyFormat({ numFmt })}
+        onBorders={(borders) => sheetApi.applyFormat({ borders })}
+        onClearFormat={sheetApi.clearFormat}
+        rangeLabel={rangeLabel}
         onInsertRow={sheetApi.insertRow}
         onDeleteRow={sheetApi.deleteRow}
         onInsertCol={sheetApi.insertCol}
@@ -295,7 +326,7 @@ export default function App() {
         onShowComments={() => setPanel(panel === "comments" ? "none" : "comments")}
         onShowView={() => setPanel(panel === "view" ? "none" : "view")}
         commentCount={comments.openCount}
-        viewActive={Boolean(filters.length || sort)}
+        viewActive={Boolean(filters.length || valueFilters.length || sorts.length)}
         canDeleteSheet={role === "owner" && Boolean(sheetApi.state.sheetId)}
         onDeleteSheet={() => void deleteCurrentSheet()}
         onLogout={handleLogout}
@@ -334,8 +365,12 @@ export default function App() {
         selected={sheetApi.state.selected}
         rawValue={rawValue}
         readOnly={!sheetApi.editable}
+        format={selectedFormat}
+        cells={sheetApi.state.cells}
+        rows={sheetApi.state.rows}
+        cols={sheetApi.state.cols}
         onStart={() =>
-          sheetApi.startEdit(sheetApi.state.selected.row, sheetApi.state.selected.col, rawValue)
+          sheetApi.startFormulaEdit(sheetApi.state.selected.row, sheetApi.state.selected.col, rawValue)
         }
         onDraft={sheetApi.setDraft}
         onCommit={() =>
@@ -378,12 +413,16 @@ export default function App() {
       {panel === "view" && sheetApi.state.sheetId && (
         <ViewPanel
           cols={sheetApi.state.cols}
+          rows={sheetApi.state.rows}
+          cells={sheetApi.state.cells}
           filters={filters}
-          sort={sort}
+          valueFilters={valueFilters}
+          sorts={sorts}
           visibleRows={rowOrder ? rowOrder.length : sheetApi.state.rows}
           totalRows={sheetApi.state.rows}
-          onSort={setSort}
+          onSorts={setSorts}
           onFilters={setFilters}
+          onValueFilters={setValueFilters}
           onClose={() => setPanel("none")}
         />
       )}
@@ -397,6 +436,7 @@ export default function App() {
           cols={sheetApi.state.cols}
           selected={sheetApi.state.selected}
           anchor={sheetApi.state.anchor}
+          selectionKind={sheetApi.state.selectionKind}
           editing={sheetApi.state.editing}
           draft={sheetApi.state.draft}
           cursors={sheetApi.state.cursors}
@@ -407,6 +447,9 @@ export default function App() {
           onSelect={sheetApi.select}
           onExtendSelect={sheetApi.extendSelect}
           onSelectAll={sheetApi.selectAll}
+          onSelectRow={sheetApi.selectRow}
+          onSelectCol={sheetApi.selectCol}
+          onRangeInfoChange={setRangeInfo}
           onClearRange={sheetApi.clearRange}
           onStartEdit={sheetApi.startEdit}
           onDraft={sheetApi.setDraft}

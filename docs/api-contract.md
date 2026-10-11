@@ -60,6 +60,21 @@ Authorization: Bearer <JWT>
 | GET | `/api/sheets/{id}/access` | viewer | 当前用户的能力说明 |
 | PUT | `/api/sheets/{id}/cells` | editor | 批量写单元格，body `{"updates":[{"row_id","col_id","value"}], "version":{clientId:seq}}` |
 | PUT | `/api/sheets/{id}/formats` | editor | 批量写格式，`updates[].format` 为 `null` 表示清除 |
+
+**单元格格式（REQ-007）**——`format` 是自由 dict，服务端不做字段白名单过滤，前端识别以下键：
+
+| 键 | 类型 | 说明 |
+|----|------|------|
+| `bold` / `italic` / `underline` / `strike` | bool | 字体样式 |
+| `font` | string | 字体族（如 `微软雅黑`） |
+| `size` | number | 字号（pt，8–72） |
+| `color` / `bg` | string | 字色 / 底色（`#rrggbb`） |
+| `align` | `left`\|`center`\|`right` | 水平对齐 |
+| `borders` | `{top,right,bottom,left}` bool | 四向边框 |
+| `numFmt` | `general`\|`number`\|`integer`\|`percent`\|`currency`\|`date`\|`text` | 数字/日期格式，**只影响显示**，不改原始值与公式求值结果 |
+
+区域格式由前端展开成多条 `cell_format` 广播（同一个 `version`）；整行/整列选中时展开为该行/列的所有单元格。
+导出 xlsx 时会映射成 Excel 的字体/边框/数字格式（`¥#,##0.00`、`0.00%`、`yyyy-mm-dd` 等）。
 | POST | `/api/sheets/{id}/ops` | editor | 通用结构操作（`insert_row`/`delete_row`/`insert_col`/`delete_col`） |
 | POST | `/api/sheets/{id}/rows` | editor | 插入行，body `{"at","counter"}` |
 | DELETE | `/api/sheets/{id}/rows/{at}` | editor | 删除行 |
@@ -156,9 +171,12 @@ Authorization: Bearer <JWT>
   因此并发插入同一位置会同时保留，且不会出现坐标漂移（越界/过期坐标会被拒绝并提示）。
 - **删除即移除**：删除行/列会连同其单元格一起删除，不存在"幽灵单元"。
 - **离线兜底**：WebSocket 不可用时前端自动改走 REST，写操作语义完全一致。
-- **视图（筛选/排序）不是数据变更**：筛选与排序都只作用于本端展示顺序
+- **视图（筛选/排序）不是数据变更**：条件筛选、按值多选筛选与多级排序都只作用于本端展示顺序
   （`Grid` 的 `rowOrder`），不改动单元格内容与存储顺序，因此无需协同合并；
   空值在排序时恒排末尾；清除视图即恢复原始行序。
+- **选区与格式**：选区（单元格矩形 / 整行 / 整列 / 全选）是本端状态；套用格式时把选区展开成
+  逐格 `cell_format` 操作走同一条协同链路，因此多端最终一致。数字格式只影响渲染函数
+  （`lib/cellDisplay.ts`），公式与导出仍用原始值。
 - 仍未实现：完整 OT/CRDT 的结构重排合并（如"移动行"）、区域级冲突提示。
 
 ## 6. 版本与存储（diff 化）
