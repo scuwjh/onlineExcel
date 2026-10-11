@@ -44,6 +44,22 @@ interface Props {
   onSelectCol: (col: number, extend?: boolean) => void;
   /** 选区尺寸变化（用于状态栏显示"4×3"）。 */
   onRangeInfoChange?: (info: { rows: number; cols: number; kind: SelectionKind }) => void;
+  /** 右键菜单（REQ-005）：把点击位置与命中的区域类型交给父组件。 */
+  onContextMenu?: (payload: {
+    x: number;
+    y: number;
+    target: "cell" | "row" | "col" | "corner";
+    row?: number;
+    col?: number;
+  }) => void;
+  /** 填充柄拖拽预览（REQ-006）：拖拽中的目标区域，null 表示未在拖拽。 */
+  fillPreview?: { r0: number; c0: number; r1: number; c1: number } | null;
+  /** 填充柄：按下 / 拖到某格 / 松开。 */
+  onFillStart?: () => void;
+  onFillMove?: (row: number, col: number) => void;
+  onFillEnd?: () => void;
+  /** 填充柄是否可用（只读或被筛选时不显示）。 */
+  fillEnabled?: boolean;
   /** Delete/Backspace：清空选区。 */
   onClearRange: (r0: number, c0: number, r1: number, c1: number) => void;
   onStartEdit: (row: number, col: number, draft: string) => void;
@@ -386,6 +402,7 @@ export default function Grid(props: Props) {
     | { mode: "cell"; anchor: { row: number; col: number } }
     | { mode: "row"; from: number }
     | { mode: "col"; from: number }
+    | { mode: "fill" }
     | null
   >(null);
   /** 本次按下是否真的拖动过（决定 click 是否再选中一次）。 */
@@ -398,6 +415,24 @@ export default function Grid(props: Props) {
     return Number.isNaN(row) ? null : row;
   }, []);
 
+  /**
+   * 把鼠标位置换算成"最近的行列"（填充柄会拖到单元格之外，命中不到格子）。
+   * 用滚动容器坐标 → 文档坐标的换算，再按行高列宽取整。
+   */
+  const nearestCellFromPoint = useCallback(
+    (e: React.MouseEvent) => {
+      const el = scrollRef.current;
+      if (!el) return null;
+      const rect = el.getBoundingClientRect();
+      const x = e.clientX - rect.left + el.scrollLeft - ROW_HEAD_W;
+      const y = e.clientY - rect.top + el.scrollTop;
+      const col = Math.min(cols - 1, Math.max(0, Math.floor(x / COL_W)));
+      const slot = Math.min(viewHeight - 1, Math.max(0, Math.floor(y / ROW_H)));
+      return { row: rowAt(slot), col };
+    },
+    [cols, rowAt, viewHeight],
+  );
+
   const colFromEvent = useCallback((e: React.MouseEvent): number | null => {
     const head = (e.target as HTMLElement).closest("[data-col-head]") as HTMLElement | null;
     if (!head) return null;
@@ -408,6 +443,15 @@ export default function Grid(props: Props) {
   const handleMouseDown = useCallback(
     (e: React.MouseEvent) => {
       if (e.button !== 0) return;
+      // 填充柄（REQ-006）：右下角小方块按下进入填充拖拽
+      if ((e.target as HTMLElement).closest("[data-fill-handle]")) {
+        e.preventDefault();
+        e.stopPropagation();
+        dragRef.current = { mode: "fill" };
+        props.onFillStart?.();
+        focusShell();
+        return;
+      }
       const rowHead = rowFromEvent(e);
       if (rowHead !== null) {
         e.preventDefault();
@@ -440,6 +484,12 @@ export default function Grid(props: Props) {
     (e: React.MouseEvent) => {
       const drag = dragRef.current;
       if (!drag) return;
+      if (drag.mode === "fill") {
+        // 填充柄拖拽：把鼠标位置换算成行列，交给父组件扩展填充目标
+        const pos = cellFromEvent(e) ?? nearestCellFromPoint(e);
+        if (pos) props.onFillMove?.(pos.row, pos.col);
+        return;
+      }
       if (drag.mode === "cell") {
         const pos = cellFromEvent(e);
         if (!pos) return;
@@ -470,17 +520,18 @@ export default function Grid(props: Props) {
   );
 
   const endDrag = useCallback(() => {
+    // 填充拖拽结束：提交填充（父组件据预览区域落库）
+    if (dragRef.current?.mode === "fill") props.onFillEnd?.();
     dragRef.current = null;
-  }, []);
+  }, [props]);
 
-  // 拖拽在表格外结束（或鼠标离开窗口）时也要收尾
+  // 拖拽在表格外结束（或鼠标离开窗口）时也要收尾——必须走 endDrag，
+  // 否则填充拖拽会在松手时丢掉提交（只在 shell 内 mouseup 才算结束）
   useEffect(() => {
-    const stop = () => {
-      dragRef.current = null;
-    };
+    const stop = () => endDrag();
     window.addEventListener("mouseup", stop);
     return () => window.removeEventListener("mouseup", stop);
-  }, []);
+  }, [endDrag]);
 
   // 把选区尺寸告诉父组件（状态栏显示）
   useEffect(() => {
@@ -521,6 +572,31 @@ export default function Grid(props: Props) {
       beginEdit(pos.row, pos.col, cells[cellKey(pos.row, pos.col)] ?? "");
     },
     [cellFromEvent, cells, readOnly, beginEdit],
+  );
+
+  /** 右键（REQ-005）：判断命中的是行号、列标还是单元格，交给父组件弹菜单。 */
+  const handleContextMenu = useCallback(
+    (e: React.MouseEvent) => {
+      if (!props.onContextMenu) return;
+      e.preventDefault();
+      const rowHead = rowFromEvent(e);
+      if (rowHead !== null) {
+        props.onContextMenu({ x: e.clientX, y: e.clientY, target: "row", row: rowHead });
+        return;
+      }
+      const colHead = colFromEvent(e);
+      if (colHead !== null) {
+        props.onContextMenu({ x: e.clientX, y: e.clientY, target: "col", col: colHead });
+        return;
+      }
+      if ((e.target as HTMLElement).closest(".corner")) {
+        props.onContextMenu({ x: e.clientX, y: e.clientY, target: "corner" });
+        return;
+      }
+      const pos = cellFromEvent(e);
+      if (pos) props.onContextMenu({ x: e.clientX, y: e.clientY, target: "cell", row: pos.row, col: pos.col });
+    },
+    [cellFromEvent, colFromEvent, props, rowFromEvent],
   );
 
   const bodyHeight = rows * ROW_H;
@@ -710,6 +786,7 @@ export default function Grid(props: Props) {
       onMouseMove={handleMouseMove}
       onMouseUp={endDrag}
       onMouseLeave={endDrag}
+      onContextMenu={handleContextMenu}
       // 便于自动化测试断言当前虚拟窗口（不影响渲染）
       data-view={`${view.rowStart}-${view.rowEnd}:${view.colStart}-${view.colEnd}:${Math.round(view.scrollTop)}:${Math.round(view.scrollLeft)}`}
       data-rows={visibleRows.length}
@@ -899,6 +976,43 @@ export default function Grid(props: Props) {
                 </div>
               ))}
             </div>
+          )}
+
+          {/* 填充预览（REQ-006）：拖拽中显示将被填充的区域 */}
+          {props.fillPreview && (
+            <div
+              className="fill-preview"
+              style={{
+                left:
+                  2 +
+                  ROW_HEAD_W +
+                  (props.fillPreview.c0 < frozenCols
+                    ? props.fillPreview.c0 * COL_W
+                    : leftPad + (props.fillPreview.c0 - view.colStart) * COL_W),
+                top: 2 + HEADER_H + props.fillPreview.r0 * ROW_H,
+                width: (props.fillPreview.c1 - props.fillPreview.c0 + 1) * COL_W,
+                height: (props.fillPreview.r1 - props.fillPreview.r0 + 1) * ROW_H,
+              }}
+            />
+          )}
+
+          {/* 填充柄（REQ-006）：选区右下角的小方块，拖拽即填充 */}
+          {props.fillEnabled && !editing && (
+            <div
+              data-fill-handle="1"
+              className="fill-handle"
+              title="拖拽填充：数字/日期按序列递增，文本复制，公式按相对引用偏移"
+              style={{
+                left:
+                  2 +
+                  ROW_HEAD_W +
+                  (range.c1 < frozenCols
+                    ? (range.c1 + 1) * COL_W
+                    : leftPad + (range.c1 + 1 - view.colStart) * COL_W) -
+                  4,
+                top: 2 + HEADER_H + (range.r1 + 1) * ROW_H - 4,
+              }}
+            />
           )}
 
           {editing && selectedVisible && editInput}

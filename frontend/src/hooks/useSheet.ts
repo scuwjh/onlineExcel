@@ -12,6 +12,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
 import * as api from "../api";
 import { cellKey } from "../lib/gridUtils";
+import { fillSeries } from "../lib/fillSeries";
 import { structureDeltas } from "../lib/structure";
 import { cellsToCsv, csvToCells, parseClipboardGrid } from "../lib/csv";
 import type { CellFormat, Cells, Cursor, Role, SheetData } from "../types";
@@ -521,14 +522,30 @@ export interface UseSheetResult {
   commitCell: (row: number, col: number, value: string) => void;
   /** 把格式套用到当前选区（单元格/框选/整行整列/全选都支持）。 */
   applyFormat: (partial: Partial<CellFormat>) => void;
-  /** 清空当前选区的格式。 */
-  clearFormat: () => void;
+  /** 把格式套用到指定范围。 */
+  applyFormatToRange: (partial: Partial<CellFormat>, range?: { r0: number; c0: number; r1: number; c1: number }) => void;
+  /** 清空指定范围（默认当前选区）的格式。 */
+  clearFormat: (range?: { r0: number; c0: number; r1: number; c1: number }) => void;
   toggleStyle: (key: "bold" | "italic" | "underline" | "strike") => void;
   pasteBlock: (row: number, col: number, text: string) => void;
   insertRow: () => void;
   deleteRow: () => void;
   insertCol: () => void;
   deleteCol: () => void;
+  /** 在指定行上方/下方插入行（右键菜单）。 */
+  insertRowAt: (row: number, above?: boolean) => void;
+  /** 删除指定行；整行选区时删除全部选中行。 */
+  deleteRowAt: (row: number) => void;
+  insertColAt: (col: number, left?: boolean) => void;
+  deleteColAt: (col: number) => void;
+  /** 拖拽填充（REQ-006）：源区域 → 目标区域。 */
+  fillRange: (
+    source: { r0: number; c0: number; r1: number; c1: number },
+    target: { r0: number; c0: number; r1: number; c1: number },
+    options?: { series: boolean; format: boolean },
+  ) => void;
+  /** 复制/剪切当前选区（cut=true 时记录源区，粘贴后清空）。 */
+  copySelection: (cut?: boolean) => string;
   undo: () => void;
   redo: () => void;
   freeze: () => void;
@@ -552,6 +569,8 @@ export function useSheet(
   /** 评论广播回调：用 ref 持有，避免 socket 回调锁死旧闭包。 */
   const onCommentAddedRef = useRef(onCommentAdded);
   onCommentAddedRef.current = onCommentAdded;
+  /** 右键"剪切"的源区域：下次粘贴时清空（Excel 语义）。 */
+  const cutRangeRef = useRef<{ r0: number; c0: number; r1: number; c1: number } | null>(null);
   const versionRef = useRef<Record<string, number>>({});
   const counterRef = useRef(0);
   /** 本端最近一次乐观写入，用于识别服务端回执（回执不带 client_id）。 */
@@ -1017,11 +1036,12 @@ export function useSheet(
    * 之前只作用于活动单元格，选区/整行整列选中时用户会以为"没生效"。
    * 这里对选区内每个单元格合并 partial，一次记录历史、一次广播多条。
    */
-  const applyFormat = useCallback(
-    (partial: Partial<CellFormat>) => {
+  /** 把格式套用到指定范围（默认当前选区）。 */
+  const applyFormatToRange = useCallback(
+    (partial: Partial<CellFormat>, range?: { r0: number; c0: number; r1: number; c1: number }) => {
       if (!editable) return;
       const { formats, rowIds, colIds } = stateRef.current;
-      const { r0, c0, r1, c1 } = targetRange();
+      const { r0, c0, r1, c1 } = range ?? targetRange();
       const updates: Array<{ row: number; col: number; format: CellFormat }> = [];
       for (let r = r0; r <= r1; r++) {
         for (let c = c0; c <= c1; c++) {
@@ -1057,11 +1077,18 @@ export function useSheet(
     [bump, editable, localId, send, targetRange],
   );
 
-  /** 清空当前选区的格式。 */
-  const clearFormat = useCallback(() => {
-    if (!editable) return;
-    const { formats, rowIds, colIds } = stateRef.current;
-    const { r0, c0, r1, c1 } = targetRange();
+  /** 兼容旧调用：把格式套用到当前选区。 */
+  const applyFormat = useCallback(
+    (partial: Partial<CellFormat>) => applyFormatToRange(partial),
+    [applyFormatToRange],
+  );
+
+  /** 清空指定范围（默认当前选区）的格式。 */
+  const clearFormat = useCallback(
+    (range?: { r0: number; c0: number; r1: number; c1: number }) => {
+      if (!editable) return;
+      const { formats, rowIds, colIds } = stateRef.current;
+      const { r0, c0, r1, c1 } = range ?? targetRange();
     const entries: Array<{ row: number; col: number; format: CellFormat | null }> = [];
     for (let r = r0; r <= r1; r++) {
       for (let c = c0; c <= c1; c++) {
@@ -1095,16 +1122,25 @@ export function useSheet(
     [applyFormat],
   );
 
+  /**
+   * 结构操作。
+   *
+   * @param kind 插入/删除行或列
+   * @param at 目标位置（默认当前活动格）；右键菜单会指定被点的那一行/列
+   */
   const structural = useCallback(
-    (kind: "row_insert" | "row_delete" | "col_insert" | "col_delete") => {
+    (kind: "row_insert" | "row_delete" | "col_insert" | "col_delete", at?: number) => {
       if (!editable) return;
       const before = stateRef.current;
       const axisRow = kind.startsWith("row");
-      const at = axisRow ? before.selected.row : before.selected.col;
-      const elementId = axisRow ? before.rowIds[at] : before.colIds[at];
+      const position = Math.max(
+        0,
+        Math.min((axisRow ? before.rows : before.cols) - 1, at ?? (axisRow ? before.selected.row : before.selected.col)),
+      );
+      const elementId = axisRow ? before.rowIds[position] : before.colIds[position];
       // 记录操作前的快照：回执到达时压入撤销栈 → 插入/删除行列可撤销
       structureGuardRef.current = { kind: "op", record: snapshotOf(before) };
-      const payload: WsMessage = { type: kind, at, client_id: localId, version: bump() };
+      const payload: WsMessage = { type: kind, at: position, client_id: localId, version: bump() };
       if (kind === "row_insert" || kind === "col_insert") {
         counterRef.current += 1;
         payload.counter = counterRef.current;
@@ -1120,6 +1156,185 @@ export function useSheet(
   const deleteRow = useCallback(() => structural("row_delete"), [structural]);
   const insertCol = useCallback(() => structural("col_insert"), [structural]);
   const deleteCol = useCallback(() => structural("col_delete"), [structural]);
+
+  /** 选区跨多行/多列时，右键删除要删掉整个选区（Excel 语义）。 */
+  const multiDeleteTargets = useCallback((axis: "row" | "col", at: number) => {
+    const { rows, cols, selected, anchor, selectionKind } = stateRef.current;
+    const limit = axis === "row" ? rows : cols;
+    if (selectionKind === "row" && axis === "row") {
+      const from = Math.min(selected.row, anchor.row);
+      const to = Math.max(selected.row, anchor.row);
+      return Array.from({ length: to - from + 1 }, (_, i) => Math.min(limit - 1, from + i));
+    }
+    if (selectionKind === "col" && axis === "col") {
+      const from = Math.min(selected.col, anchor.col);
+      const to = Math.max(selected.col, anchor.col);
+      return Array.from({ length: to - from + 1 }, (_, i) => Math.min(limit - 1, from + i));
+    }
+    return [Math.max(0, Math.min(limit - 1, at))];
+  }, []);
+
+  /** 右键菜单：在被点行号的**上方/下方**插入行（下方 = 该行索引 +1）。 */
+  const insertRowAt = useCallback(
+    (row: number, above = true) => structural("row_insert", above ? row : row + 1),
+    [structural],
+  );
+  /** 删除被点的行；若选区跨多行，则删掉整个选区。 */
+  const deleteRowAt = useCallback(
+    (row: number) => {
+      const items = multiDeleteTargets("row", row);
+      // 从后往前删，避免索引位移
+      for (const at of [...items].sort((a, b) => b - a)) structural("row_delete", at);
+    },
+    [multiDeleteTargets, structural],
+  );
+  const insertColAt = useCallback(
+    (col: number, left = true) => structural("col_insert", left ? col : col + 1),
+    [structural],
+  );
+  const deleteColAt = useCallback(
+    (col: number) => {
+      const items = multiDeleteTargets("col", col);
+      for (const at of [...items].sort((a, b) => b - a)) structural("col_delete", at);
+    },
+    [multiDeleteTargets, structural],
+  );
+
+  /**
+   * 拖拽填充（REQ-006）。
+   *
+   * `source` 是含源数据的矩形，`target` 是拖拽到的矩形（两者沿某轴相邻）。
+   * 支持序列（等差/日期/数字+文本）、公式相对引用偏移、文本复制，并可同时复制格式。
+   */
+  const fillRange = useCallback(
+    (
+      source: { r0: number; c0: number; r1: number; c1: number },
+      target: { r0: number; c0: number; r1: number; c1: number },
+      options: { series: boolean; format: boolean } = { series: true, format: true },
+    ) => {
+      if (!editable) return;
+      const { rows, cols, cells, formats, rowIds, colIds } = stateRef.current;
+      const horizontal = target.c0 !== source.c0 || target.c1 !== source.c1;
+      const vertical = target.r0 !== source.r0 || target.r1 !== source.r1;
+      if (!horizontal && !vertical) return;
+
+      const clampRow = (r: number) => Math.max(0, Math.min(rows - 1, r));
+      const clampCol = (c: number) => Math.max(0, Math.min(cols - 1, c));
+      const tr0 = clampRow(Math.min(target.r0, target.r1));
+      const tr1 = clampRow(Math.max(target.r0, target.r1));
+      const tc0 = clampCol(Math.min(target.c0, target.c1));
+      const tc1 = clampCol(Math.max(target.c0, target.c1));
+
+      const updates: Record<string, string | null> = {};
+      const formatUpdates: Array<{ row: number; col: number; format: CellFormat | null }> = [];
+
+      // 方向判断必须用**未排序**的目标边界：tr0/tr1 是 min/max 之后的（永远上小下大），
+      // 用它去比较会得到 fillDown/fillUp 都为 false（曾经的 bug：填充落空值）
+      const fillDown = vertical && target.r1 > source.r1;
+      const fillUp = vertical && target.r0 < source.r0;
+      const fillRight = horizontal && target.c1 > source.c1;
+      const fillLeft = horizontal && target.c0 < source.c0;
+      const verticalFill = (fillDown || fillUp) && !horizontal;
+      const horizontalFill = (fillRight || fillLeft) && !vertical;
+
+      for (let r = tr0; r <= tr1; r++) {
+        for (let c = tc0; c <= tc1; c++) {
+          // 目标区里落在源矩形内的格子不动
+          if (r >= source.r0 && r <= source.r1 && c >= source.c0 && c <= source.c1) continue;
+          let sources: string[] = [];
+          let dRowPerStep = 0;
+          let dColPerStep = 0;
+          if (verticalFill) {
+            const col = c;
+            const from = fillDown ? source.r0 : source.r1;
+            const to = fillDown ? source.r1 : source.r0;
+            for (let sr = from; fillDown ? sr <= to : sr >= to; sr = fillDown ? sr + 1 : sr - 1) {
+              sources.push(cells[cellKey(sr, col)] ?? (options.series ? "" : ""));
+            }
+            dRowPerStep = fillDown ? 1 : -1;
+          } else {
+            const row = r;
+            const from = fillRight ? source.c0 : source.c1;
+            const to = fillRight ? source.c1 : source.c0;
+            for (let sc = from; fillRight ? sc <= to : sc >= to; sc = fillRight ? sc + 1 : sc - 1) {
+              sources.push(cells[cellKey(row, sc)] ?? "");
+            }
+            dColPerStep = fillRight ? 1 : -1;
+          }
+          // 生成到当前格需要的步数
+          const steps = verticalFill
+            ? fillDown
+              ? r - source.r1
+              : source.r0 - r
+            : fillRight
+              ? c - source.c1
+              : source.c0 - c;
+          const generated = options.series
+            ? fillSeries(sources, steps, verticalFill, dRowPerStep, dColPerStep)
+            : [];
+          const value = options.series ? (generated[steps - 1] ?? "") : sources[0] ?? "";
+          updates[cellKey(r, c)] = value === "" ? null : value;
+
+          if (options.format) {
+            // 格式跟随：取源区对应行/列的格式（Excel 的填充柄也会带格式）
+            const srcRow = verticalFill ? (fillDown ? source.r1 : source.r0) : r;
+            const srcCol = horizontalFill ? (fillRight ? source.c1 : source.c0) : c;
+            formatUpdates.push({ row: r, col: c, format: formats[cellKey(srcRow, srcCol)] ?? null });
+          }
+        }
+      }
+
+      if (!Object.keys(updates).length) return;
+      applyCellMap(updates);
+      if (formatUpdates.length) {
+        const meaningful = formatUpdates.filter((item) => item.format && Object.keys(item.format).length);
+        if (meaningful.length) {
+          dispatch({ type: "LOCAL_FORMATS", entries: meaningful, record: false });
+          const version = bump();
+          for (const item of meaningful) {
+            send({
+              type: "cell_format",
+              row: item.row,
+              col: item.col,
+              row_id: rowIds[item.row],
+              col_id: colIds[item.col],
+              format: item.format,
+              client_id: localId,
+              version,
+            });
+          }
+        }
+      }
+    },
+    [applyCellMap, bump, dispatch, editable, localId, send],
+  );
+
+  /** 把选区序列化为制表符分隔文本（供右键"复制"/"剪切"与状态栏提示）。 */
+  const rangeToText = useCallback((range: { r0: number; c0: number; r1: number; c1: number }) => {
+    const { cells } = stateRef.current;
+    const lines: string[] = [];
+    for (let r = range.r0; r <= range.r1; r++) {
+      const line: string[] = [];
+      for (let c = range.c0; c <= range.c1; c++) line.push(cells[cellKey(r, c)] ?? "");
+      lines.push(line.join("\t"));
+    }
+    return lines.join("\n");
+  }, []);
+
+  /** 复制当前选区到系统剪贴板。 */
+  const copySelection = useCallback(
+    (cut = false) => {
+      const range = targetRange();
+      const text = rangeToText(range);
+      void navigator.clipboard?.writeText(text);
+      if (cut && editable) {
+        // 剪切：粘贴时清空源区（Excel 语义），这里用 ref 记下来
+        cutRangeRef.current = range;
+      }
+      return text;
+    },
+    [editable, rangeToText, targetRange],
+  );
 
   /** 计算把 ``target`` 恢复成当前状态所需的单元格写入。 */
   /** 撤销/重做时，把结构迁移到目标快照：先删后插，元素 ID 精确回放（服务端接受显式 ID）。 */
@@ -1313,6 +1528,7 @@ export function useSheet(
     cancelEdit,
     commitCell,
     applyFormat,
+    applyFormatToRange,
     clearFormat,
     toggleStyle,
     pasteBlock,
@@ -1320,6 +1536,12 @@ export function useSheet(
     deleteRow,
     insertCol,
     deleteCol,
+    insertRowAt,
+    deleteRowAt,
+    insertColAt,
+    deleteColAt,
+    fillRange,
+    copySelection,
     undo,
     redo,
     freeze,

@@ -1,7 +1,8 @@
-/** 应用外壳：登录 → 表格工作区（协同编辑 + 历史版本 + 成员权限 + 评论 + 筛选排序 + Excel）。 */
+/** 应用外壳：登录 → 表格工作区（协同编辑 + 历史版本 + 成员权限 + 评论 + 筛选排序 + Excel + 右键菜单/拖拽填充）。 */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "./api";
 import CommentsPanel from "./components/CommentsPanel";
+import ContextMenu, { type MenuItem } from "./components/ContextMenu";
 import FormulaBar from "./components/FormulaBar";
 import Grid from "./components/Grid";
 import { PermissionsPanel, VersionsPanel } from "./components/Panels";
@@ -13,9 +14,20 @@ import { useSheet } from "./hooks/useSheet";
 import { cellKey } from "./lib/gridUtils";
 import { computeRowOrder } from "./lib/viewFilter";
 import { evaluate } from "./lib/formula";
-import type { ColumnFilter, Role, SheetData, SheetSummary, SortRule, ValueFilter } from "./types";
+import { describeFill } from "./lib/fillSeries";
+import type { ColumnFilter, NumberFormat, Role, SheetData, SheetSummary, SortRule, ValueFilter } from "./types";
+import { NUMBER_FORMAT_LABELS } from "./types";
 
 type Panel = "none" | "versions" | "permissions" | "comments" | "view";
+
+/** 右键菜单的上下文。 */
+interface MenuContext {
+  x: number;
+  y: number;
+  target: "cell" | "row" | "col" | "corner";
+  row?: number;
+  col?: number;
+}
 
 export default function App() {
   const [token, setToken] = useState<string | null>(() => api.getToken());
@@ -35,6 +47,10 @@ export default function App() {
     cols: 1,
     kind: "cell",
   });
+  /** 右键菜单上下文（REQ-005）。 */
+  const [menu, setMenu] = useState<MenuContext | null>(null);
+  /** 填充拖拽的目标区域预览（REQ-006）。 */
+  const [fillPreview, setFillPreview] = useState<{ r0: number; c0: number; r1: number; c1: number } | null>(null);
   const xlsxRef = useRef<HTMLInputElement>(null);
 
   const refreshList = useCallback(async () => {
@@ -171,7 +187,211 @@ export default function App() {
     return `${rangeInfo.rows}×${rangeInfo.cols} 选区`;
   }, [rangeInfo]);
 
+  /**
+   * 右键菜单项（REQ-005）。
+   *
+   * 按命中区域（单元格 / 行号 / 列标 / 左上角）给出对应操作；
+   * 菜单本身不持有业务逻辑，全部调用 useSheet 暴露的操作。
+   */
+  const openContextMenu = useCallback(
+    (payload: MenuContext) => {
+      // 右键单元格：先选中它（与 Excel 一致），行号/列标则整行整列选中
+      if (payload.target === "row" && payload.row !== undefined) {
+        sheetApi.selectRow(payload.row);
+      } else if (payload.target === "col" && payload.col !== undefined) {
+        sheetApi.selectCol(payload.col);
+      } else if (payload.target === "cell" && payload.row !== undefined && payload.col !== undefined) {
+        const inRange =
+          payload.row >= Math.min(sheetApi.state.selected.row, sheetApi.state.anchor.row) &&
+          payload.row <= Math.max(sheetApi.state.selected.row, sheetApi.state.anchor.row) &&
+          payload.col >= Math.min(sheetApi.state.selected.col, sheetApi.state.anchor.col) &&
+          payload.col <= Math.max(sheetApi.state.selected.col, sheetApi.state.anchor.col);
+        if (!inRange) sheetApi.select(payload.row, payload.col);
+      }
+      setMenu(payload);
+      // 焦点交还网格：菜单项执行后（例如"清空内容"）用户会直接按 Ctrl+Z，
+      // 焦点若停在已卸载的菜单按钮上，快捷键会丢失（撤销看起来"没生效"）
+      requestAnimationFrame(() => {
+        document.querySelector<HTMLElement>(".grid-shell")?.focus();
+      });
+    },
+    [sheetApi],
+  );
+
+  const menuItems = useMemo<MenuItem[]>(() => {
+    if (!menu) return [];
+    const editable = sheetApi.editable;
+    const sep = (key: string): MenuItem => ({ key, separator: true });
+    const items: MenuItem[] = [];
+
+    if (menu.target === "row") {
+      items.push(
+        {
+          key: "row-insert-above",
+          label: "在上方插入行",
+          disabled: !editable,
+          onSelect: () => sheetApi.insertRowAt(menu.row ?? 0, true),
+        },
+        {
+          key: "row-insert-below",
+          label: "在下方插入行",
+          disabled: !editable,
+          onSelect: () => sheetApi.insertRowAt(menu.row ?? 0, false),
+        },
+        {
+          key: "row-delete",
+          label: `删除选中行${rangeInfo.rows > 1 ? `（${rangeInfo.rows} 行）` : ""}`,
+          disabled: !editable,
+          danger: true,
+          onSelect: () => sheetApi.deleteRowAt(menu.row ?? 0),
+        },
+        sep("row-sep"),
+        { key: "row-clear-format", label: "清除行格式", disabled: !editable, onSelect: () => sheetApi.clearFormat() },
+      );
+      return items;
+    }
+
+    if (menu.target === "col") {
+      items.push(
+        { key: "col-insert-left", label: "在左侧插入列", disabled: !editable, onSelect: () => sheetApi.insertColAt(menu.col ?? 0, true) },
+        { key: "col-insert-right", label: "在右侧插入列", disabled: !editable, onSelect: () => sheetApi.insertColAt(menu.col ?? 0, false) },
+        {
+          key: "col-delete",
+          label: `删除选中列${rangeInfo.cols > 1 ? `（${rangeInfo.cols} 列）` : ""}`,
+          disabled: !editable,
+          danger: true,
+          onSelect: () => sheetApi.deleteColAt(menu.col ?? 0),
+        },
+        sep("col-sep"),
+        { key: "col-clear-format", label: "清除列格式", disabled: !editable, onSelect: () => sheetApi.clearFormat() },
+      );
+      return items;
+    }
+
+    // 单元格 / 矩形选区
+    items.push(
+      { key: "copy", label: "复制", hint: "Ctrl+C", onSelect: () => sheetApi.copySelection(false) },
+      { key: "cut", label: "剪切", hint: "Ctrl+X", disabled: !editable, onSelect: () => sheetApi.copySelection(true) },
+      sep("clip-sep"),
+      {
+        key: "clear-value",
+        label: "清空内容",
+        hint: "Delete",
+        disabled: !editable,
+        onSelect: () => {
+          const r = sheetApi.targetRange();
+          sheetApi.clearRange(r.r0, r.c0, r.r1, r.c1);
+        },
+      },
+      {
+        key: "clear-format",
+        label: "清除格式",
+        disabled: !editable,
+        onSelect: () => sheetApi.clearFormat(),
+      },
+      sep("fmt-sep"),
+      {
+        key: "bold",
+        label: selectedFormat.bold ? "取消加粗" : "加粗",
+        hint: "B",
+        disabled: !editable,
+        onSelect: () => sheetApi.toggleStyle("bold"),
+      },
+      sep("numfmt-sep"),
+      ...(Object.keys(NUMBER_FORMAT_LABELS) as NumberFormat[]).map((key) => ({
+        key: `numfmt-${key}`,
+        label: `数字格式：${NUMBER_FORMAT_LABELS[key]}`,
+        disabled: !editable,
+        onSelect: () => sheetApi.applyFormat({ numFmt: key }),
+      })),
+      sep("border-sep"),
+      {
+        key: "border-all",
+        label: "四边加边框",
+        disabled: !editable,
+        onSelect: () => sheetApi.applyFormat({ borders: { top: true, right: true, bottom: true, left: true } }),
+      },
+      {
+        key: "border-none",
+        label: "清除边框",
+        disabled: !editable,
+        onSelect: () => sheetApi.applyFormat({ borders: { top: false, right: false, bottom: false, left: false } }),
+      },
+      sep("struct-sep"),
+      { key: "row-insert", label: "在选中行上方插入行", disabled: !editable, onSelect: () => sheetApi.insertRow() },
+      { key: "row-delete", label: "删除选中行", disabled: !editable, danger: true, onSelect: () => sheetApi.deleteRow() },
+      { key: "col-insert", label: "在选中列左侧插入列", disabled: !editable, onSelect: () => sheetApi.insertCol() },
+      { key: "col-delete", label: "删除选中列", disabled: !editable, danger: true, onSelect: () => sheetApi.deleteCol() },
+      sep("comment-sep"),
+      {
+        key: "comment",
+        label: "添加评论 / @提醒",
+        onSelect: () => {
+          sheetApi.select(sheetApi.state.selected.row, sheetApi.state.selected.col);
+          setPanel("comments");
+        },
+      },
+      {
+        key: "freeze-here",
+        label: "冻结到当前单元格",
+        onSelect: () => sheetApi.freeze(),
+      },
+    );
+    return items;
+  }, [menu, rangeInfo.cols, rangeInfo.rows, selectedFormat.bold, sheetApi]);
+
   const notify = useMemo(() => (message: string) => setToast(message), []);
+
+  /**
+   * 填充柄（REQ-006）：按住右下角小方块拖动。
+   *
+   * 拖拽期间只算"目标矩形"用于预览；松手时一次性调用 fillRange，
+   * 由它按源数据推断序列（数字等差 / 日期 / 公式相对引用 / 文本复制）。
+   */
+  const fillStateRef = useRef<{ source: { r0: number; c0: number; r1: number; c1: number } } | null>(null);
+
+  const onFillStart = useCallback(() => {
+    fillStateRef.current = { source: sheetApi.targetRange() };
+    setFillPreview(null);
+  }, [sheetApi]);
+
+  const onFillMove = useCallback((row: number, col: number) => {
+    const state = fillStateRef.current;
+    if (!state) return;
+    const { source } = state;
+    // 纵向优先：鼠标超出行范围 → 向下/向上填充；否则横向
+    let target = { ...source };
+    if (row > source.r1) target = { ...source, r1: row };
+    else if (row < source.r0) target = { ...source, r0: row };
+    else if (col > source.c1) target = { ...source, c1: col };
+    else if (col < source.c0) target = { ...source, c0: col };
+    setFillPreview(target);
+  }, []);
+
+  const onFillEnd = useCallback(() => {
+    const state = fillStateRef.current;
+    const target = fillPreview;
+    fillStateRef.current = null;
+    setFillPreview(null);
+    if (!state || !target) return;
+    if (
+      target.r0 === state.source.r0 &&
+      target.r1 === state.source.r1 &&
+      target.c0 === state.source.c0 &&
+      target.c1 === state.source.c1
+    ) {
+      return; // 没拖动，什么也不做
+    }
+    sheetApi.fillRange(state.source, target, { series: true, format: true });
+    const hint = describeFill(
+      Array.from(
+        { length: state.source.r1 - state.source.r0 + 1 },
+        (_, i) => sheetApi.state.cells[cellKey(state.source.r0 + i, state.source.c0)] ?? "",
+      ),
+    );
+    notify(`${hint}：${target.r1 - target.r0 + 1} 行 × ${target.c1 - target.c0 + 1} 列`);
+  }, [fillPreview, notify, sheetApi]);
+
   useEffect(() => {
     if (sheetApi.state.error) {
       notify(sheetApi.state.error);
@@ -467,6 +687,12 @@ export default function App() {
             sheetApi.select(row, col);
             setPanel("comments");
           }}
+          onContextMenu={openContextMenu}
+          fillPreview={fillPreview}
+          onFillStart={onFillStart}
+          onFillMove={onFillMove}
+          onFillEnd={onFillEnd}
+          fillEnabled={sheetApi.editable}
         />
       )}
       {!sheetApi.state.loading && !sheetApi.state.sheetId && (
@@ -479,6 +705,8 @@ export default function App() {
         </div>
       )}
       {toast && <div className="toast">{toast}</div>}
+      {/* 右键菜单（REQ-005） */}
+      {menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems} onClose={() => setMenu(null)} />}
     </div>
   );
 }

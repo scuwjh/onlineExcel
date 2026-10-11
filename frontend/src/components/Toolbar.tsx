@@ -177,7 +177,7 @@ export default function Toolbar(props: Props) {
           </option>
         ))}
       </select>
-      <button disabled={!editable} onClick={props.onClearFormat} title="清除选区格式">
+      <button disabled={!editable} onClick={() => props.onClearFormat()} title="清除选区格式">
         清格式
       </button>
       <span className="range-label" title="当前选区">
