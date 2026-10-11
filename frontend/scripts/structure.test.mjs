@@ -1,14 +1,12 @@
 import { build } from "esbuild";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
-await build({
-  entryPoints: ["src/lib/structure.ts"],
-  bundle: true,
-  format: "esm",
-  outfile: "/tmp/structure.bundle.mjs",
-  logLevel: "silent",
-});
-
-const { structureDeltas } = await import("/tmp/structure.bundle.mjs");
+// 用系统临时目录，避免硬编码 "/tmp" 在 Windows 上被解析成 C:\tmp
+const workDir = mkdtempSync(join(tmpdir(), "oe-structure-"));
+const bundlePath = join(workDir, "structure.bundle.mjs");
 
 let pass = 0, fail = 0;
 function check(name, actual, expected) {
@@ -38,20 +36,35 @@ function roundtrip(name, from, to, axis) {
   check(`${name} -> 删除先于插入`, firstDel === -1 || firstIns === -1 || firstDel < firstIns, true);
 }
 
-console.log("structureDeltas 单元测试");
-roundtrip("无变化", ["r1","r2","r3"], ["r1","r2","r3"], "row");
-roundtrip("删两行", ["r1","r2","r3","r4"], ["r1","r4"], "row");
-roundtrip("中间插行", ["r1","r2"], ["r1","r9","r2"], "row");
-roundtrip("头部插行", ["r1","r2"], ["r9","r1","r2"], "row");
-roundtrip("尾部插行", ["r1","r2"], ["r1","r2","r9"], "row");
-roundtrip("先删后插", ["r1","r2","r3"], ["r1","r3","r9"], "row");
-roundtrip("多列混合", ["c1","c2","c3","c4"], ["c1","c8","c4"], "col");
-roundtrip("撤销插行(删回)", ["r1","r9","r2"], ["r1","r2"], "row");
-roundtrip("撤销删行(插回)", ["r1","r2"], ["r1","r9","r2"], "row");
-roundtrip("连续插入两个", ["r1"], ["r8","r1","r9"], "row");
+let structureDeltas;
+try {
+  await build({
+    entryPoints: ["src/lib/structure.ts"],
+    bundle: true,
+    format: "esm",
+    outfile: bundlePath,
+    logLevel: "silent",
+  });
+  ({ structureDeltas } = await import(pathToFileURL(bundlePath).href));
 
-const ops = structureDeltas(["r1","r2"], ["r1","r5","r2"], "row");
-check("插入携带目标 ID", ops.filter(o => o.type.endsWith("insert")).map(o => o.element_id), ["r5"]);
+  console.log("structureDeltas 单元测试");
+  roundtrip("无变化", ["r1","r2","r3"], ["r1","r2","r3"], "row");
+  roundtrip("删两行", ["r1","r2","r3","r4"], ["r1","r4"], "row");
+  roundtrip("中间插行", ["r1","r2"], ["r1","r9","r2"], "row");
+  roundtrip("头部插行", ["r1","r2"], ["r9","r1","r2"], "row");
+  roundtrip("尾部插行", ["r1","r2"], ["r1","r2","r9"], "row");
+  roundtrip("先删后插", ["r1","r2","r3"], ["r1","r3","r9"], "row");
+  roundtrip("多列混合", ["c1","c2","c3","c4"], ["c1","c8","c4"], "col");
+  roundtrip("撤销插行(删回)", ["r1","r9","r2"], ["r1","r2"], "row");
+  roundtrip("撤销删行(插回)", ["r1","r2"], ["r1","r9","r2"], "row");
+  roundtrip("连续插入两个", ["r1"], ["r8","r1","r9"], "row");
 
-console.log(`\n${pass} 通过, ${fail} 失败`);
+  const ops = structureDeltas(["r1","r2"], ["r1","r5","r2"], "row");
+  check("插入携带目标 ID", ops.filter(o => o.type.endsWith("insert")).map(o => o.element_id), ["r5"]);
+
+  console.log(`\n${pass} 通过, ${fail} 失败`);
+} finally {
+  rmSync(workDir, { recursive: true, force: true });
+}
+
 process.exit(fail ? 1 : 0);
