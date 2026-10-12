@@ -1181,3 +1181,93 @@ select {
   color: #4a5568;
 }
 
+
+/* ---------------------------------------------------------------- 合并单元格（REQ-113） */
+
+/* 合并区域内"非左上角"的单元格：内容由覆盖层绘制，这里只留底色占位 */
+.cell.merged-hidden span {
+  visibility: hidden;
+}
+
+.cell.merged-hidden {
+  border-color: transparent;
+}
+
+/* 合并区域覆盖层：坐标由 JS 按行高/列宽与冻结层换算，这里只补视觉细节 */
+.merge-overlay {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: none;
+}
+
+/* ------------------------------------------------- 个性化设置 / 查找替换（REQ-110/111） */
+
+.settings-panel .panel-body,
+.find-panel .panel-body {
+  gap: 10px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.settings-panel table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.settings-panel th,
+.settings-panel td {
+  padding: 3px 6px;
+  text-align: left;
+  border-bottom: 1px solid #eef1f5;
+}
+
+.settings-panel .key-spec {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: #1f2329;
+}
+
+.settings-panel .group-title {
+  margin: 6px 0 2px;
+  font-weight: 600;
+  color: #4a5568;
+}
+
+.settings-panel .color-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.find-panel .hit-item {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  width: 100%;
+  padding: 2px 6px;
+  border: none;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.find-panel .hit-item:hover {
+  background: #f2f6ff;
+}
+
+.find-panel .hit-item.active {
+  background: #e6efff;
+  font-weight: 600;
+}
+
+.find-panel .hit-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 160px;
+  overflow-y: auto;
+  border: 1px solid #eef1f5;
+  border-radius: 4px;
+}

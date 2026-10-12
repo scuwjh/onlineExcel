@@ -6,16 +6,20 @@
 ## 项目结构与模块组织
 
 - `frontend/` — React 18 + TypeScript + Vite 前端。
-  - `src/hooks/useSheet.ts` — 协同状态机（乐观更新、服务端权威校准、版本向量）。
+  - `src/hooks/useSheet.ts` — 协同状态机（乐观更新、服务端权威校准、版本向量、合并区域与撤销重做）。
+  - `src/hooks/usePreferences.ts` — 个性化偏好（快捷键/常用颜色/Enter 方向，服务端按用户保存）。
+  - `src/lib/shortcuts.ts` / `findReplace.ts` / `merge.ts` / `copyImage.ts` — 快捷键解析、查找替换、
+    合并区域运算、复制为图片（ESM，纯函数，配 `scripts/*.test.mjs` node 单测）。
   - `src/components/Grid.tsx` — 虚拟滚动网格（sticky 冻结行列 + 事件委托，DOM 节点数恒定）。
   - `src/components/Panels.tsx` — 历史版本面板（diff/恢复）与成员权限面板。
   - `src/ws.ts` / `src/api.ts` — 实时通道与 REST 客户端（令牌注入、401 清理会话）。
 - `backend/` — Python + FastAPI + SQLite，提供 REST API 与 WebSocket 协同服务。
-  - `app/crdt.py` — 协同状态机：LWW 寄存器、有序行列元素、操作应用与重放（纯函数，便于单测）。
+  - `app/crdt.py` — 协同状态机：LWW 寄存器、有序行列元素、合并区域（元素 ID 锚定）、操作应用与重放（纯函数，便于单测）。
   - `app/store.py` — 数据访问：用户/权限/表格/操作日志/版本（增量、快照、压缩、diff）。
   - `app/auth.py` — PBKDF2 口令、JWT 签发校验、RBAC 判定。
   - `app/routes.py` / `app/ws.py` — REST 与 WebSocket 入口，两者共用同一操作日志语义。
   - `app/bootstrap.py` — 启动引导与 v1（全表快照）→ v2（增量）迁移。
+  - `app/dingtalk.py` — 钉钉机器人推送（REQ-115）：加签、@手机号、后台线程投递，失败不影响写入。
   - `tests/` — pytest：鉴权与 RBAC、版本 diff 化与迁移、CRDT 收敛、WebSocket。
 - `docs/api-contract.md` — 前后端共同依据的接口契约，**接口变更需先改此文档**。
 - `docker-compose.yml` — 单机部署配置。
@@ -45,7 +49,7 @@
 
 - `pip install -r requirements.txt` — 运行依赖；`requirements-dev.txt` 追加 pytest/httpx。
 - `uvicorn app.main:app --reload` — 本地启动，API 文档见 `/docs`。
-- `pytest` — 运行测试（39 项，覆盖鉴权、版本、CRDT、WebSocket）。
+- `pytest` — 运行测试（100 项，覆盖鉴权、版本、CRDT、WebSocket、Excel/评论、合并、偏好、钉钉）。
 
 前端（`frontend/`）：
 
@@ -73,7 +77,9 @@
 - 端到端回归脚本（仓库自带，发布前都应跑通）：
   - `scripts/verify-e2e.py` — HTTP + WebSocket 断言（协同收敛、权限边界、大表格 reload 退化、版本 diff/恢复）；
   - `scripts/verify-ui.py` — 浏览器 UI 断言（登录、虚拟滚动、编辑/公式/撤销重做、剪贴板粘贴、面板、双标签同步），
-    需要 Playwright + 系统 Edge，并同时启动后端与 `npm run dev`。
+    需要 Playwright + 系统 Edge，并同时启动后端与 `npm run dev`；
+  - `scripts/verify-new-features.py` — 本轮新增功能（REQ-110..115）：合并单元格的投影/扩展/版本 diff/恢复、
+    个性化偏好读写与校验、钉钉集成状态与权限；UI 部分缺 Playwright 时记为 SKIP。
 
 ## 提交与 Pull Request 规范
 

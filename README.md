@@ -55,7 +55,20 @@ diff 化历史版本、CRDT 风格的并发收敛，以及万行级虚拟滚动�
 - **筛选与排序**（REQ-101）：条件筛选（包含/等于/大于…，多条件为「并且」）、
   **按值多选筛选**（勾选要保留的值，带搜索）、**多级排序**（先按第 1 条，相同再按第 2 条，可调优先级）；
   两者都是**本端视图**，不改动存储数据，空值恒排在末尾，面板与状态栏会提示当前生效的视图。
-- **删除表格**：仅所有者可删除，连带清理权限、单元格、结构、版本、操作日志与评论。
+- **个性化快捷键**（REQ-110）：命令表 + 键位解析（`lib/shortcuts.ts`），
+  可在「设置」面板录制/清除按键、恢复默认、查看冲突；内置命令覆盖撤销重做、复制剪切粘贴、
+  加粗斜体、**多色填色/高亮**、**自动求和/求平均**、合并单元格、插入删除行列、冻结、查找替换等；
+  配置按用户存服务端（`GET/PUT /api/preferences`），跨设备生效。
+- **查找与替换**（REQ-111）：本端浮动面板，支持区分大小写、整格匹配、正则与 `$1` 反向引用，
+  「上一个/下一个」按展示顺序跳转，结果列表可点击定位，「全部替换」一次进撤销栈。
+- **Enter 跳转方向**（REQ-112）：提交后向下/上/左/右或停在原处（可设置），`Shift+Enter` 反向。
+- **合并单元格**（REQ-113）：区域按**稳定元素 ID** 锚定，随行列插删自动跟随；
+  进入操作日志/增量版本/版本 diff/历史恢复/撤销重做/WebSocket 广播；合并只隐藏不清空数据。
+- **复制即图片**（REQ-114）：复制选区时剪贴板同时写入 `text/plain`（TSV）、`text/html`（带样式表格）
+  与 `image/png`（区域截图），粘贴到钉钉等 IM 会自动成为图片；不支持图片写入时退化为纯文本。
+- **钉钉机器人**（REQ-115）：评论中的 @提及 会推送到钉钉群机器人（webhook + 加签 + 按用户名映射手机号，
+  精确 @ 到人）；推送在后台线程执行，**失败不影响评论落库**；配置全部来自环境变量，接口只回状态不回密钥。
+- **删除表格**：仅所有者可删除，连带清理权限、单元格、结构、合并、版本、操作日志与评论。
 - **冻结窗格**：独立分层实现（滚动区 + 左侧冻结列 + 顶部冻结行 + 左上角），本地视图状态。
 - **撤销/重做**：本地历史栈（Ctrl+Z / Ctrl+Shift+Z），会以写操作形式同步到服务端。
 - **大表格保护**：单帧 WebSocket 体积超限时退化为 `reload` 提示，客户端改用 REST 拉取。
@@ -70,9 +83,10 @@ backend/
     auth.py        PBKDF2 口令、JWT 签发校验、RBAC 判定
     db.py          SQLite 连接、建表、v1→v2 迁移
     crdt.py        协同状态机（LWW 寄存器、有序行列元素、操作应用/重放）
-    store.py       数据访问：用户、权限、表格、操作日志、版本（增量/快照/压缩/diff）、评论
+    store.py       数据访问：用户、权限、表格、操作日志、版本（增量/快照/压缩/diff）、评论、合并、个性化偏好
     routes.py      REST 路由（鉴权、表格、单元格、格式、行列、版本、权限、Excel、评论）
     xlsx.py        Excel(.xlsx) 导入解析与导出渲染（openpyxl）
+    dingtalk.py    钉钉机器人推送（webhook + 加签 + @手机号，后台线程，失败不影响写入）
     ws.py          WebSocket 房间、鉴权、广播与瘦身回退
     bootstrap.py   启动引导：管理员、v1 全表快照迁移
   tests/           pytest：鉴权/RBAC、版本 diff、CRDT 收敛、WebSocket、Excel 与评论
@@ -87,7 +101,11 @@ frontend/
     components/Panels.tsx      历史版本面板 + 成员权限面板
     components/CommentsPanel.tsx  评论与 @提醒面板
     components/ViewPanel.tsx      筛选与排序面板
+    components/SettingsPanel.tsx      个性化设置（快捷键录制/常用颜色/Enter 方向/钉钉状态）
+    components/FindReplacePanel.tsx   查找与替换面板
+    hooks/usePreferences.ts      个性化偏好（服务端按用户保存）
     lib/formula.ts / csv.ts / gridUtils.ts / viewFilter.ts
+    lib/shortcuts.ts / findReplace.ts / merge.ts / copyImage.ts   纯逻辑层（各有 node 单测）
 docs/api-contract.md  接口契约（REST + WebSocket + 环境变量）
 ```
 
@@ -119,7 +137,8 @@ npm run dev        # http://localhost:5173（已配置 /api 与 /ws 代理到 :8
 ## 测试
 
 ```bash
-# 后端：鉴权/RBAC、版本 diff 化与迁移、CRDT 收敛、WebSocket、Excel 与评论（60 项）
+# 后端：鉴权/RBAC、版本 diff 化与迁移、CRDT 收敛、WebSocket、Excel 与评论、
+# 合并单元格、个性化偏好、钉钉机器人（100 项）
 cd backend
 pip install -r requirements-dev.txt
 pytest
@@ -157,8 +176,15 @@ python scripts/verify-view.py
 #    数字/日期/文本/公式填充、横向填充、填充落库
 python scripts/verify-menu-fill.py
 
-# 7) 前端纯函数单测（无需服务）：结构增量迁移、填充序列推断
-cd frontend && node scripts/structure.test.mjs && node scripts/fill.test.mjs
+# 7) 个性化快捷键/合并/钉钉（18 项 API 断言 + 可选 UI 断言）：合并单元格的投影/扩展/版本 diff/恢复、
+#    个性化偏好读写与校验、钉钉集成状态与权限边界
+pip install httpx
+python scripts/verify-new-features.py                       # 仅 API：需后端
+python scripts/verify-new-features.py http://127.0.0.1:5173 # 加前端地址则附带 UI 断言
+
+# 8) 前端纯函数单测（无需服务）：结构增量迁移、填充序列、快捷键解析、查找替换、
+#    合并区域运算、复制为图片布局
+cd frontend && for f in scripts/*.test.mjs; do node "$f"; done
 ```
 
 `verify-ui.py` / `verify-grid.py` / `verify-view.py` 会把界面截图写到 `scripts/artifacts/`（已在 `.gitignore` 中忽略），便于人工核对渲染效果。
@@ -183,7 +209,21 @@ docker compose up --build      # 前端 http://localhost:8080，后端 http://lo
 
 生产部署请显式设置 `OE_JWT_SECRET`、`OE_ADMIN_PASSWORD`，并把 `OE_DEV_AUTO_REGISTER` 设为 `0`；
 在反向代理层启用 HTTPS（NFR-030）。Excel 导入依赖 `openpyxl`（已列入 `backend/requirements.txt`），
-可用 `OE_MAX_XLSX_BYTES`（默认 10MB）限制上传体积，`OE_MAX_COMMENT_CHARS`（默认 2000）限制评论长度。
+可用 `OE_MAX_XLSX_BYTES`（默认 10MB）限制上传体积，`OE_MAX_COMMENT_CHARS`（默认 2000）限制评论长度，
+`OE_MAX_PREFS_CHARS`（默认 16384）限制单用户个性化配置体积。
+
+### 钉钉机器人（REQ-115，可选）
+
+```bash
+export OE_DINGTALK_ENABLED=1
+export OE_DINGTALK_WEBHOOK="https://oapi.dingtalk.com/robot/send?access_token=xxx"
+export OE_DINGTALK_SECRET="SECxxx"                       # 机器人「加签」密钥，可留空
+export OE_DINGTALK_MOBILES='{"alice":"13800000000"}'      # 用户名 → 手机号，用于精确 @
+```
+
+评论里 `@alice` 时，机器人会在群里 @ 到该手机号；未配置时功能自动关闭，
+`GET /api/integrations/dingtalk` 只返回状态（不回传 webhook/secret），
+表格所有者可用 `POST /api/integrations/dingtalk/test` 发一条测试消息。
 
 ## 尚未实现
 

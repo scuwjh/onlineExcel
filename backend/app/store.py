@@ -180,6 +180,11 @@ def rename_sheet(conn, sheet_id: str, name: str) -> None:
 # --------------------------------------------------------------- 状态落库与操作应用
 
 
+def _merge_region_id(region: tuple) -> str:
+    """合并区域的主键：四个元素 ID 拼接（顺序固定为 r0,c0,r1,c1）。"""
+    return "|".join(str(part) for part in region)
+
+
 def _write_state(conn, state: crdt.SheetState, structure_changed: bool = True) -> None:
     """把状态投影写回派生表。
 
@@ -193,6 +198,16 @@ def _write_state(conn, state: crdt.SheetState, structure_changed: bool = True) -
         conn.executemany(
             "INSERT INTO structure (sheet_id, axis, position, element_id) VALUES (?, ?, ?, ?)",
             [(sheet_id, axis, position, element) for axis, position, element in state.structural_elements()],
+        )
+        # 合并区域（REQ-113）与行列结构一样属于"结构类"派生状态：只在结构可能变化时重写。
+        conn.execute("DELETE FROM merges WHERE sheet_id = ?", (sheet_id,))
+        ts_merge = now_iso()
+        conn.executemany(
+            "INSERT INTO merges (sheet_id, region_id, r0_id, c0_id, r1_id, c1_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (sheet_id, _merge_region_id(region), region[0], region[1], region[2], region[3], ts_merge)
+                for region in state.merges
+            ],
         )
     conn.execute("DELETE FROM cells WHERE sheet_id = ?", (sheet_id,))
     conn.executemany(
@@ -310,9 +325,10 @@ def apply_ops(sheet_id: str, ops: list, user: str, client_id: str = "") -> dict:
             for seq, kind, payload, version in sorted(assignments, key=lambda x: x[0]):
                 crdt.apply_op(state, kind, payload, seq=seq, client_id=client_id, version=version)
 
-            # 只有结构类操作才需要重写 structure 表（万行规模下是主要开销）。
+            # 只有结构类操作才需要重写 structure/merges 表（万行规模下是主要开销）。
             structure_changed = any(
-                kind in crdt.STRUCTURAL_KINDS or kind == crdt.OP_REPLACE for _, kind, _, _ in assignments
+                kind in crdt.STRUCTURAL_KINDS or kind in crdt.MERGE_KINDS or kind == crdt.OP_REPLACE
+                for _, kind, _, _ in assignments
             )
             parent = conn.execute(
                 "SELECT COALESCE(MAX(id), 0) AS id FROM versions WHERE sheet_id = ?", (sheet_id,)
@@ -356,11 +372,12 @@ def replace_sheet(
     formats: Optional[dict] = None,
     row_ids: Optional[list] = None,
     col_ids: Optional[list] = None,
+    merges: Optional[list] = None,
 ) -> dict:
     """整体替换（CSV 导入 / 版本恢复）→ 一条 ``replace`` 操作 + 一个版本。
 
     版本恢复（REQ-042）可传入 ``row_ids``/``col_ids`` 保留原元素 ID，
-    避免评论等按元素 ID 锚定的数据失效。
+    避免评论等按元素 ID 锚定的数据失效；``merges`` 让合并区域（REQ-113）一起恢复。
     """
     if not (1 <= int(rows) <= config.MAX_ROWS and 1 <= int(cols) <= config.MAX_COLS):
         raise crdt.InvalidOperation(f"行列数超限：rows≤{config.MAX_ROWS}, cols≤{config.MAX_COLS}")
@@ -369,6 +386,7 @@ def replace_sheet(
         "cols": int(cols),
         "cells": cells or {},
         "formats": formats or {},
+        "merges": merges or [],
         "client": client_id or "import",
     }
     if row_ids is not None:
@@ -479,6 +497,7 @@ def materialize_version(conn, sheet_id: str, version_id: int) -> crdt.SheetState
             "cols": 0,
             "cells": {},
             "formats": {},
+            "merges": [],
         }
         state = crdt.state_from_projection(
             name="",
@@ -487,6 +506,7 @@ def materialize_version(conn, sheet_id: str, version_id: int) -> crdt.SheetState
             cells=projection["cells"],
             formats=projection["formats"],
             batch=sheet_id,
+            merges=projection.get("merges") or [],
         )
         state.sheet_id = sheet_id
         op_rows = conn.execute(
@@ -579,6 +599,15 @@ def diff_versions(conn, sheet_id: str, from_id: int, to_id: int, limit: int = 20
         if key not in rfmt:
             fmt_removed.append({"cell": key, "format": value})
 
+    # 合并区域（REQ-113）也参与 diff：按区域本身（而非单元格）比对。
+    def _region_key(item: dict) -> str:
+        return f'{item.get("r0")}:{item.get("c0")}:{item.get("r1")}:{item.get("c1")}'
+
+    lmerge = {_region_key(item): item for item in left.get("merges") or []}
+    rmerge = {_region_key(item): item for item in right.get("merges") or []}
+    merge_added = [rmerge[key] for key in rmerge if key not in lmerge]
+    merge_removed = [lmerge[key] for key in lmerge if key not in rmerge]
+
     def _capped(items: list) -> dict:
         return {"items": items[:limit], "truncated": len(items) > limit, "total": len(items)}
 
@@ -599,11 +628,16 @@ def diff_versions(conn, sheet_id: str, from_id: int, to_id: int, limit: int = 20
             "removed": _capped(fmt_removed),
             "changed": _capped(fmt_changed),
         },
+        "merges": {
+            "added": _capped(merge_added),
+            "removed": _capped(merge_removed),
+        },
         "summary": {
             "added": len(added),
             "removed": len(removed),
             "changed": len(changed),
             "formats": len(fmt_added) + len(fmt_removed) + len(fmt_changed),
+            "merges": len(merge_added) + len(merge_removed),
         },
     }
 
@@ -659,6 +693,7 @@ def sheet_payload(conn, sheet_id: str, role: Optional[str] = None) -> dict:
         "cols": projection["cols"],
         "cells": projection["cells"],
         "formats": projection["formats"],
+        "merges": projection.get("merges") or [],
         "version": int(version_row["id"] or 0),
         "seq": state.seq,
         "rowIds": state.row_ids,
@@ -787,9 +822,47 @@ def sheet_members(conn, sheet_id: str) -> list:
     ]
 
 
-#: 与表格相关的所有表（删除表格时逐一清理，避免留下孤儿数据）。
-_SHEET_TABLES = ("permissions", "cells", "structure", "versions", "ops", "comments")
+# ------------------------------------------------------------------- 个性化偏好
 
+
+def get_preferences(conn, user_id: int) -> dict:
+    """读取用户的个性化配置（REQ-110/112）；未设置过返回空 dict，由前端补默认值。"""
+    row = conn.execute("SELECT prefs FROM user_preferences WHERE user_id = ?", (user_id,)).fetchone()
+    if not row:
+        return {}
+    try:
+        data = json.loads(row["prefs"])
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_preferences(conn, user_id: int, prefs: dict) -> dict:
+    """覆盖式保存个性化配置（一个用户一行）。"""
+    blob = json.dumps(prefs, ensure_ascii=False)
+    if len(blob) > config.MAX_PREFS_CHARS:
+        raise crdt.InvalidOperation(f"个性化配置过大（上限 {config.MAX_PREFS_CHARS} 字符）")
+    conn.execute(
+        """
+        INSERT INTO user_preferences (user_id, prefs, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET prefs = excluded.prefs, updated_at = excluded.updated_at
+        """,
+        (user_id, blob, now_iso()),
+    )
+    return prefs
+
+
+def owned_sheet_count(conn, user_id: int) -> int:
+    """该用户拥有 owner 权限的表格数（钉钉测试推送等管理动作的门槛）。"""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM permissions WHERE user_id = ? AND role = 'owner'",
+        (user_id,),
+    ).fetchone()
+    return int(row["n"] if row else 0)
+
+
+#: 与表格相关的所有表（删除表格时逐一清理，避免留下孤儿数据）。
+_SHEET_TABLES = ("permissions", "cells", "structure", "merges", "versions", "ops", "comments")
 
 def delete_sheet(conn, sheet_id: str) -> bool:
     """删除表格及其全部派生数据（仅所有者可操作，路由层负责鉴权）。"""

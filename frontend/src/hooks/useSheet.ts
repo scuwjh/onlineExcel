@@ -15,16 +15,18 @@ import { cellKey } from "../lib/gridUtils";
 import { fillSeries } from "../lib/fillSeries";
 import { structureDeltas } from "../lib/structure";
 import { cellsToCsv, csvToCells, parseClipboardGrid } from "../lib/csv";
-import type { CellFormat, Cells, Cursor, Role, SheetData } from "../types";
+import type { CellFormat, Cells, Cursor, MergeRegion, Role, SheetData } from "../types";
 import { DEFAULT_COLS, DEFAULT_ROWS } from "../types";
 import { connectWS, type WsClient, type WsMessage } from "../ws";
+import { diffMerges, hiddenCells, mergeRegions, mergesEqual, unmergeRegions } from "../lib/merge";
+import { buildClipboardText, copyGridWithImage, type CopyGrid } from "../lib/copyImage";
 
 export interface CellPoint {
   row: number;
   col: number;
 }
 
-/** 撤销/重做快照：一次写操作前的完整状态（单元格值 + 格式 + 结构）。 */
+/** 撤销/重做快照：一次写操作前的完整状态（单元格值 + 格式 + 结构 + 合并区域）。 */
 export interface HistoryEntry {
   cells: Cells;
   formats: Record<string, CellFormat>;
@@ -32,6 +34,7 @@ export interface HistoryEntry {
   cols: number;
   rowIds: string[];
   colIds: string[];
+  merges: MergeRegion[];
 }
 
 /** 选区类型（REQ-002/003）。 */
@@ -44,6 +47,8 @@ export interface SheetState {  sheetId: string | null;
   formats: Record<string, CellFormat>;
   rowIds: string[];
   colIds: string[];
+  /** 合并区域（REQ-113）：服务端以元素 ID 存，投影到这里已是下标。 */
+  merges: MergeRegion[];
   rows: number;
   cols: number;
   version: number;
@@ -102,6 +107,7 @@ type Action =
       type: "REMOTE_STRUCTURE";
       cells?: Cells;
       formats?: Record<string, CellFormat>;
+      merges?: MergeRegion[];
       rowIds?: string[];
       colIds?: string[];
       rows?: number;
@@ -115,6 +121,8 @@ type Action =
     }
   | { type: "SET_CURSOR"; cursor: Cursor }
   | { type: "SET_PRESENCE"; user: string; online: boolean; users?: string[] }
+  /** 本端发起的合并/取消合并：乐观更新合并区域并入撤销栈。 */
+  | { type: "LOCAL_MERGE"; merges: MergeRegion[]; record?: boolean }
   | { type: "FREEZE"; rows: number; cols: number }
   | { type: "UNFREEZE" }
   | { type: "STATUS"; status: SheetState["status"] }
@@ -130,6 +138,7 @@ const initialState: SheetState = {
   role: null,
   cells: {},
   formats: {},
+  merges: [],
   rowIds: [],
   colIds: [],
   rows: DEFAULT_ROWS,
@@ -155,7 +164,7 @@ const initialState: SheetState = {
 
 const HISTORY_LIMIT = 50;
 
-/** 取当前状态的撤销快照（含格式与结构），历史栈与重做栈均用此类型。 */
+/** 取当前状态的撤销快照（含格式、结构与合并区域），历史栈与重做栈均用此类型。 */
 function snapshotOf(state: SheetState): HistoryEntry {
   return {
     cells: state.cells,
@@ -164,6 +173,7 @@ function snapshotOf(state: SheetState): HistoryEntry {
     cols: state.cols,
     rowIds: state.rowIds,
     colIds: state.colIds,
+    merges: state.merges,
   };
 }
 
@@ -181,6 +191,7 @@ function reducer(state: SheetState, action: Action): SheetState {
         role: action.sheet.role,
         cells: action.sheet.cells,
         formats: action.sheet.formats,
+        merges: action.sheet.merges ?? [],
         rowIds: action.sheet.rowIds ?? [],
         colIds: action.sheet.colIds ?? [],
         rows: action.sheet.rows,
@@ -358,6 +369,7 @@ function reducer(state: SheetState, action: Action): SheetState {
           ...state,
           cells: action.cells ?? state.cells,
           formats: action.formats ?? state.formats,
+          merges: action.merges ?? state.merges,
           rowIds: action.rowIds ?? state.rowIds,
           colIds: action.colIds ?? state.colIds,
           rows: action.rows ?? state.rows,
@@ -373,6 +385,7 @@ function reducer(state: SheetState, action: Action): SheetState {
         ...state,
         cells: action.cells ?? state.cells,
         formats: action.formats ?? state.formats,
+        merges: action.merges ?? state.merges,
         rowIds: action.rowIds ?? state.rowIds,
         colIds: action.colIds ?? state.colIds,
         rows: action.rows ?? state.rows,
@@ -382,6 +395,16 @@ function reducer(state: SheetState, action: Action): SheetState {
         editing: null,
         history: action.preserve ? state.history : [],
         future: action.preserve ? state.future : [],
+      };
+    }
+    case "LOCAL_MERGE": {
+      const record = action.record !== false;
+      return {
+        ...state,
+        merges: action.merges,
+        editing: null,
+        history: record ? pushHistory(state, snapshotOf(state)) : state.history,
+        future: record ? [] : state.future,
       };
     }
     case "SET_CURSOR":
@@ -544,8 +567,16 @@ export interface UseSheetResult {
     target: { r0: number; c0: number; r1: number; c1: number },
     options?: { series: boolean; format: boolean },
   ) => void;
-  /** 复制/剪切当前选区（cut=true 时记录源区，粘贴后清空）。 */
-  copySelection: (cut?: boolean) => string;
+  /** 复制/剪切当前选区（cut=true 时记录源区，粘贴后清空）；同时写入图片以便粘到 IM。 */
+  copySelection: (cut?: boolean, withImage?: boolean) => string;
+  /** 合并当前选区（REQ-113）；单格会提示并忽略。 */
+  mergeSelection: () => void;
+  /** 取消活动单元格所在的合并区域（REQ-113）。 */
+  unmergeSelection: () => void;
+  /** 活动单元格所在的合并区域（没有则为 null），供菜单/工具栏禁用判断。 */
+  activeMerge: MergeRegion | null;
+  /** 批量写入单元格（查找替换等复用撤销栈的一条历史）。 */
+  applyCellUpdates: (updates: Record<string, string | null>, record?: boolean) => void;
   undo: () => void;
   redo: () => void;
   freeze: () => void;
@@ -630,6 +661,7 @@ export function useSheet(
               type: "REMOTE_STRUCTURE",
               cells: msg.cells,
               formats: msg.formats,
+              merges: msg.merges as MergeRegion[] | undefined,
               rowIds: msg.rowIds,
               colIds: msg.colIds,
               rows: msg.rows,
@@ -699,6 +731,8 @@ export function useSheet(
         case "row_delete":
         case "col_insert":
         case "col_delete":
+        case "merge":
+        case "unmerge":
         case "sheet_import": {
           // 本端自己发起的结构操作回执：见 structureGuardRef 注释
           const guard = structureGuardRef.current;
@@ -725,6 +759,7 @@ export function useSheet(
             type: "REMOTE_STRUCTURE",
             cells: msg.cells,
             formats: msg.formats,
+            merges: msg.merges as MergeRegion[] | undefined,
             rowIds: msg.rowIds,
             colIds: msg.colIds,
             rows: msg.rows,
@@ -1201,6 +1236,59 @@ export function useSheet(
   );
 
   /**
+   * 合并当前选区（REQ-113）。
+   *
+   * 乐观更新合并区域，同时按元素 ID 发出 `merge` 操作（与行列插删同一套协同链路：
+   * 操作日志 → 增量版本 → 广播 → 撤销栈）。单格选区会被拒绝并提示。
+   */
+  const mergeSelection = useCallback(() => {
+    if (!editable) return;
+    const before = stateRef.current;
+    const { r0, c0, r1, c1 } = targetRange();
+    if ((r1 - r0 + 1) * (c1 - c0 + 1) < 2) {
+      notify("合并区域至少需要 2 个单元格");
+      return;
+    }
+    dispatch({ type: "LOCAL_MERGE", merges: mergeRegions(before.merges, { r0, c0, r1, c1 }) });
+    const ids = {
+      row_start_id: before.rowIds[r0],
+      col_start_id: before.colIds[c0],
+      row_end_id: before.rowIds[r1],
+      col_end_id: before.colIds[c1],
+    };
+    if (!ids.row_start_id || !ids.col_start_id || !ids.row_end_id || !ids.col_end_id) return;
+    structureGuardRef.current = { kind: "op", record: snapshotOf(before) };
+    send({ type: "merge", ...ids, client_id: localId, version: bump() });
+  }, [bump, editable, localId, notify, send, targetRange]);
+
+  /** 取消合并：去掉包含活动单元格的整个区域（未合并时无操作）。 */
+  const unmergeSelection = useCallback(() => {
+    if (!editable) return;
+    const before = stateRef.current;
+    const { row, col } = before.selected;
+    const next = unmergeRegions(before.merges, row, col);
+    if (next === before.merges) return;
+    dispatch({ type: "LOCAL_MERGE", merges: next });
+    const rowId = before.rowIds[row];
+    const colId = before.colIds[col];
+    if (!rowId || !colId) return;
+    structureGuardRef.current = { kind: "op", record: snapshotOf(before) };
+    send({ type: "unmerge", row_id: rowId, col_id: colId, client_id: localId, version: bump() });
+  }, [bump, editable, localId, send]);
+
+  /** 当前活动单元格是否落在某个合并区域内（右键菜单/工具栏据此禁用"取消合并"）。 */
+  const activeMerge = useMemo(() => {
+    const { selected } = state;
+    return state.merges.find(
+      (region) =>
+        selected.row >= region.r0 &&
+        selected.row <= region.r1 &&
+        selected.col >= region.c0 &&
+        selected.col <= region.c1,
+    ) ?? null;
+  }, [state.merges, state.selected]);
+
+  /**
    * 拖拽填充（REQ-006）。
    *
    * `source` 是含源数据的矩形，`target` 是拖拽到的矩形（两者沿某轴相邻）。
@@ -1321,19 +1409,57 @@ export function useSheet(
     return lines.join("\n");
   }, []);
 
-  /** 复制当前选区到系统剪贴板。 */
+  /**
+   * 把选区整理成"复制用"的二维数据（REQ-114）。
+   *
+   * 合并区域只保留左上角的值（与 Excel 的复制语义一致），其余被隐藏的格子输出空串。
+   */
+  const buildCopyGrid = useCallback((range: { r0: number; c0: number; r1: number; c1: number }): CopyGrid => {
+    const { cells, formats, merges } = stateRef.current;
+    const hidden = hiddenCells(merges);
+    const grid: CopyGrid = [];
+    for (let r = range.r0; r <= range.r1; r++) {
+      const row: Array<{ text: string; format?: CellFormat }> = [];
+      for (let c = range.c0; c <= range.c1; c++) {
+        const key = cellKey(r, c);
+        row.push({
+          text: hidden.has(key) ? "" : cells[key] ?? "",
+          format: formats[key],
+        });
+      }
+      grid.push(row);
+    }
+    return grid;
+  }, []);
+
+  /**
+   * 复制当前选区到系统剪贴板（REQ-114）。
+   *
+   * 同时写入 `text/plain`（TSV，粘到 Excel 保持行列）、`text/html`（带样式表格）
+   * 与 `image/png`（区域截图）：钉钉等 IM 会优先取图片，因此粘贴后自动成为图片；
+   * 浏览器不支持图片写入时自动退化为纯文本。
+   */
   const copySelection = useCallback(
-    (cut = false) => {
+    (cut = false, withImage = true) => {
       const range = targetRange();
-      const text = rangeToText(range);
-      void navigator.clipboard?.writeText(text);
+      const grid = buildCopyGrid(range);
+      const text = buildClipboardText(grid);
+      if (withImage) {
+        void copyGridWithImage(grid).then((result) => {
+          if (result.mode === "failed") {
+            notify("复制失败：当前浏览器不允许写入剪贴板");
+          }
+        });
+      } else {
+        void navigator.clipboard?.writeText(text);
+      }
       if (cut && editable) {
         // 剪切：粘贴时清空源区（Excel 语义），这里用 ref 记下来
         cutRangeRef.current = range;
       }
       return text;
     },
-    [editable, rangeToText, targetRange],
+    [buildCopyGrid, editable, notify, targetRange],
   );
 
   /** 计算把 ``target`` 恢复成当前状态所需的单元格写入。 */
@@ -1356,6 +1482,38 @@ export function useSheet(
         }
         msg.element_id = op.element_id;
         send(msg);
+      }
+    },
+    [bump, localId, send],
+  );
+
+  /**
+   * 撤销/重做时把合并区域迁移到目标快照（REQ-113）。
+   *
+   * 与结构迁移同理：只发**差异**（先取消、后合并），并用 structureGuardRef 占位，
+   * 保证合并回执到达期间撤销/重做栈不被清空。
+   */
+  const sendMergeTransition = useCallback(
+    (target: HistoryEntry, mode: "undo" | "redo") => {
+      const before = stateRef.current;
+      const { toMerge, toUnmerge } = diffMerges(before.merges, target.merges);
+      if (!toMerge.length && !toUnmerge.length) return;
+      structureGuardRef.current = { kind: mode, remaining: toMerge.length + toUnmerge.length };
+      for (const region of toUnmerge) {
+        const rowId = before.rowIds[region.r0];
+        const colId = before.colIds[region.c0];
+        if (!rowId || !colId) continue;
+        send({ type: "unmerge", row_id: rowId, col_id: colId, client_id: localId, version: bump() });
+      }
+      for (const region of toMerge) {
+        const ids = {
+          row_start_id: target.rowIds[region.r0],
+          col_start_id: target.colIds[region.c0],
+          row_end_id: target.rowIds[region.r1],
+          col_end_id: target.colIds[region.c1],
+        };
+        if (!ids.row_start_id || !ids.col_start_id || !ids.row_end_id || !ids.col_end_id) continue;
+        send({ type: "merge", ...ids, client_id: localId, version: bump() });
       }
     },
     [bump, localId, send],
@@ -1409,12 +1567,14 @@ export function useSheet(
       entry.cols !== before.cols ||
       !sameIds(entry.rowIds, before.rowIds) ||
       !sameIds(entry.colIds, before.colIds);
+    const hasMerges = !mergesEqual(entry.merges, before.merges);
     dispatch({ type: "UNDO" });
     if (!hasStructure) {
       const cells = diffCells(before.cells, entry.cells);
       if (Object.keys(cells).length) applyCellMap(cells, false);
       const formats = diffFormats(before.formats, entry.formats);
       if (Object.keys(formats).length) sendFormatTargets(formats, entry);
+      if (hasMerges) sendMergeTransition(entry, "undo");
       return;
     }
     // 结构差异：结构操作先发（回执带权威投影），单元格/格式差异随后按目标元素 ID 写回。
@@ -1429,7 +1589,9 @@ export function useSheet(
     if (payload.length) sendCellTargets(payload, keys, before.sheetId);
     const formats = diffFormats(before.formats, entry.formats);
     if (Object.keys(formats).length) sendFormatTargets(formats, entry);
-  }, [applyCellMap, sendCellTargets, sendFormatTargets, sendStructureTransition]);
+    // 合并差异放在结构迁移之后发：锚点元素 ID 在目标结构里才存在。
+    if (hasMerges) sendMergeTransition(entry, "undo");
+  }, [applyCellMap, sendCellTargets, sendFormatTargets, sendMergeTransition, sendStructureTransition]);
 
   const redo = useCallback(() => {
     const before = stateRef.current;
@@ -1440,12 +1602,14 @@ export function useSheet(
       entry.cols !== before.cols ||
       !sameIds(entry.rowIds, before.rowIds) ||
       !sameIds(entry.colIds, before.colIds);
+    const hasMerges = !mergesEqual(entry.merges, before.merges);
     dispatch({ type: "REDO" });
     if (!hasStructure) {
       const cells = diffCells(before.cells, entry.cells);
       if (Object.keys(cells).length) applyCellMap(cells, false);
       const formats = diffFormats(before.formats, entry.formats);
       if (Object.keys(formats).length) sendFormatTargets(formats, entry);
+      if (hasMerges) sendMergeTransition(entry, "redo");
       return;
     }
     const payload: api.CellTarget[] = [];
@@ -1459,7 +1623,8 @@ export function useSheet(
     if (payload.length) sendCellTargets(payload, keys, before.sheetId);
     const formats = diffFormats(before.formats, entry.formats);
     if (Object.keys(formats).length) sendFormatTargets(formats, entry);
-  }, [applyCellMap, sendCellTargets, sendFormatTargets, sendStructureTransition]);
+    if (hasMerges) sendMergeTransition(entry, "redo");
+  }, [applyCellMap, sendCellTargets, sendFormatTargets, sendMergeTransition, sendStructureTransition]);
 
   const freeze = useCallback(() => {
     const { selected } = stateRef.current;
@@ -1542,6 +1707,10 @@ export function useSheet(
     deleteColAt,
     fillRange,
     copySelection,
+    mergeSelection,
+    unmergeSelection,
+    activeMerge,
+    applyCellUpdates: applyCellMap,
     undo,
     redo,
     freeze,

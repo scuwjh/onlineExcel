@@ -7,6 +7,7 @@ import type {
   Role,
   SheetData,
   SheetSummary,
+  UserPreferences,
   VersionDiff,
   VersionEntry,
 } from "./types";
@@ -338,6 +339,33 @@ export async function deleteComment(
   commentId: number,
 ): Promise<{ deleted: number; counts: Record<string, number> }> {
   return request(`/sheets/${id}/comments/${commentId}`, { method: "DELETE" });
+}
+
+// --------------------------------------------------------------- 个性化偏好（REQ-110/112）
+
+export async function getPreferences(): Promise<Partial<UserPreferences>> {
+  return request("/preferences");
+}
+
+export async function savePreferences(prefs: UserPreferences): Promise<UserPreferences> {
+  return request("/preferences", { method: "PUT", body: JSON.stringify(prefs) });
+}
+
+// ------------------------------------------------------------------ 钉钉集成（REQ-115）
+
+export interface DingTalkStatus {
+  enabled: boolean;
+  configured: boolean;
+  has_secret: boolean;
+  mobile_map_size: number;
+}
+
+export async function getDingTalkStatus(): Promise<DingTalkStatus> {
+  return request("/integrations/dingtalk");
+}
+
+export async function testDingTalk(): Promise<{ ok: boolean; errmsg?: string }> {
+  return request("/integrations/dingtalk/test", { method: "POST" });
 }
 
 export type { Cells };

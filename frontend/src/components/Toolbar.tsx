@@ -37,6 +37,11 @@ interface Props {
   onShowPermissions: () => void;
   onShowComments: () => void;
   onShowView: () => void;
+  /** 查找替换（REQ-111）与个性化设置（REQ-110/112/115）入口。 */
+  onShowFind: () => void;
+  onShowSettings: () => void;
+  findActive?: boolean;
+  settingsActive?: boolean;
   commentCount: number;
   viewActive: boolean;
   canDeleteSheet: boolean;
@@ -244,6 +249,21 @@ export default function Toolbar(props: Props) {
         title="评论与 @提醒"
       >
         评论{props.commentCount > 0 ? ` ${props.commentCount}` : ""}
+      </button>
+      <span className="divider" />
+      <button
+        className={props.findActive ? "active" : ""}
+        onClick={props.onShowFind}
+        title="查找与替换 (Ctrl+F / Ctrl+H)"
+      >
+        查找替换
+      </button>
+      <button
+        className={props.settingsActive ? "active" : ""}
+        onClick={props.onShowSettings}
+        title="个性化设置：快捷键、常用颜色、Enter 行为、钉钉集成 (Ctrl+,)"
+      >
+        设置
       </button>
       <span className="divider" />
       <button onClick={props.onShowVersions} title="查看历史版本与对比">

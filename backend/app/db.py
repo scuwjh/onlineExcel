@@ -16,7 +16,7 @@ from . import config
 
 _local = threading.local()
 _write_lock = threading.RLock()
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -110,6 +110,25 @@ CREATE TABLE IF NOT EXISTS comments (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_comments_sheet ON comments (sheet_id, id);
+
+-- 合并单元格区域（REQ-113）：四角用稳定元素 ID 锚定，插删行列后自动跟随。
+CREATE TABLE IF NOT EXISTS merges (
+    sheet_id TEXT NOT NULL,
+    region_id TEXT NOT NULL,
+    r0_id TEXT NOT NULL,
+    c0_id TEXT NOT NULL,
+    r1_id TEXT NOT NULL,
+    c1_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (sheet_id, region_id)
+);
+
+-- 按用户的个性化配置（REQ-110/112）：一行一用户，prefs 为 JSON。
+CREATE TABLE IF NOT EXISTS user_preferences (
+    user_id INTEGER PRIMARY KEY,
+    prefs TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 

@@ -1,24 +1,42 @@
-/** 应用外壳：登录 → 表格工作区（协同编辑 + 历史版本 + 成员权限 + 评论 + 筛选排序 + Excel + 右键菜单/拖拽填充）。 */
+/** 应用外壳：登录 → 表格工作区（协同编辑 + 历史版本 + 成员权限 + 评论 + 筛选排序 + Excel + 右键菜单/拖拽填充 + 查找替换/个性化设置）。 */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "./api";
 import CommentsPanel from "./components/CommentsPanel";
 import ContextMenu, { type MenuItem } from "./components/ContextMenu";
+import FindReplacePanel from "./components/FindReplacePanel";
 import FormulaBar from "./components/FormulaBar";
 import Grid from "./components/Grid";
 import { PermissionsPanel, VersionsPanel } from "./components/Panels";
 import PresenceBar from "./components/PresenceBar";
+import SettingsPanel from "./components/SettingsPanel";
 import Toolbar from "./components/Toolbar";
 import ViewPanel from "./components/ViewPanel";
 import { useComments } from "./hooks/useComments";
+import { usePreferences } from "./hooks/usePreferences";
 import { useSheet } from "./hooks/useSheet";
-import { cellKey } from "./lib/gridUtils";
+import { cellKey, refOf } from "./lib/gridUtils";
 import { computeRowOrder } from "./lib/viewFilter";
 import { evaluate } from "./lib/formula";
 import { describeFill } from "./lib/fillSeries";
+import {
+  DEFAULT_FIND_OPTIONS,
+  compileMatcher,
+  findMatches,
+  findMatchesInOrder,
+  nextHitIndex,
+  replaceAll as replaceAllInSheet,
+  replaceInValue,
+  type FindHit,
+  type FindOptions,
+} from "./lib/findReplace";
+import { regionLabel } from "./lib/merge";
 import type { ColumnFilter, NumberFormat, Role, SheetData, SheetSummary, SortRule, ValueFilter } from "./types";
 import { NUMBER_FORMAT_LABELS } from "./types";
 
-type Panel = "none" | "versions" | "permissions" | "comments" | "view";
+type Panel = "none" | "versions" | "permissions" | "comments" | "view" | "settings" | "find";
+
+/** 查找结果上限（与 lib/findReplace 的默认值一致）。 */
+const FIND_LIMIT = 2000;
 
 /** 右键菜单的上下文。 */
 interface MenuContext {
@@ -83,6 +101,209 @@ export default function App() {
 
   const comments = useComments(sheetApi.state.sheetId);
   commentsBridge.current = comments;
+
+  /** 统一的轻提示（偏好 hook / 命令分发都用它）。 */
+  const notify = useMemo(() => (message: string) => setToast(message), []);
+
+  // ---------------------------------------------- 个性化偏好（REQ-110/112）
+  const prefsApi = usePreferences(!!token, notify);
+
+  // ---------------------------------------------- 钉钉集成状态（REQ-115）
+  const [dingtalk, setDingtalk] = useState<api.DingTalkStatus | null>(null);
+  useEffect(() => {
+    if (!token) {
+      setDingtalk(null);
+      return;
+    }
+    void api
+      .getDingTalkStatus()
+      .then(setDingtalk)
+      .catch(() => setDingtalk(null));
+  }, [token]);
+
+  /** 公式快捷键（REQ-110）：把 SUM/AVERAGE 写到选区下方（单格时写回自身）。 */
+  const insertAggregate = useCallback(
+    (kind: "SUM" | "AVERAGE"): boolean => {
+      if (!sheetApi.editable) return true;
+      const { selected, rows, cells } = sheetApi.state;
+      const range = sheetApi.targetRange();
+      const single = range.r0 === range.r1 && range.c0 === range.c1;
+      let target = { row: selected.row, col: selected.col };
+      let source = range;
+      if (single) {
+        // Excel 的自动求和：先向上找连续块，其次向左找
+        let r0 = selected.row;
+        while (r0 - 1 >= 0 && (cells[cellKey(r0 - 1, selected.col)] ?? "") !== "") r0 -= 1;
+        if (r0 < selected.row) {
+          source = { r0, c0: selected.col, r1: selected.row - 1, c1: selected.col };
+        } else {
+          let c0 = selected.col;
+          while (c0 - 1 >= 0 && (cells[cellKey(selected.row, c0 - 1)] ?? "") !== "") c0 -= 1;
+          if (c0 === selected.col) {
+            notify("没有可计算的数据：请先选中要汇总的区域");
+            return true;
+          }
+          source = { r0: selected.row, c0, r1: selected.row, c1: selected.col - 1 };
+        }
+      } else if (range.r1 + 1 < rows) {
+        target = { row: range.r1 + 1, col: selected.col };
+      }
+      const formula = `=${kind}(${refOf(source.r0, source.c0)}:${refOf(source.r1, source.c1)})`;
+      sheetApi.commitCell(target.row, target.col, formula);
+      sheetApi.select(target.row, target.col);
+      return true;
+    },
+    [notify, sheetApi],
+  );
+
+  /**
+   * 快捷键命令分发（REQ-110）。
+   *
+   * 命令 ID 由 `lib/shortcuts.ts` 定义（含用户自定义的颜色类命令），
+   * 返回 true 表示已处理；返回 false 时网格会退回自带的默认按键逻辑。
+   */
+  const runCommand = useCallback(
+    (commandId: string): boolean => {
+      const selected = sheetApi.state.selected;
+      if (commandId.startsWith("format.fill.")) {
+        sheetApi.applyFormat({ bg: commandId.slice("format.fill.".length) });
+        return true;
+      }
+      if (commandId.startsWith("format.highlight.")) {
+        sheetApi.applyFormat({ color: commandId.slice("format.highlight.".length) });
+        return true;
+      }
+      switch (commandId) {
+        case "edit.undo":
+          sheetApi.undo();
+          return true;
+        case "edit.redo":
+          sheetApi.redo();
+          return true;
+        case "edit.copy":
+          sheetApi.copySelection(false);
+          notify("已复制（含图片，可直接粘贴到钉钉）");
+          return true;
+        case "edit.cut":
+          sheetApi.copySelection(true);
+          return true;
+        case "edit.paste":
+          if (sheetApi.editable) {
+            void navigator.clipboard?.readText().then((text) => {
+              if (text) sheetApi.pasteBlock(selected.row, selected.col, text);
+            });
+          }
+          return true;
+        case "edit.clear": {
+          if (!sheetApi.editable) return true;
+          const range = sheetApi.targetRange();
+          sheetApi.clearRange(range.r0, range.c0, range.r1, range.c1);
+          return true;
+        }
+        case "edit.selectAll":
+          sheetApi.selectAll();
+          return true;
+        case "edit.edit":
+          if (sheetApi.editable) {
+            sheetApi.startEdit(selected.row, selected.col, sheetApi.state.cells[cellKey(selected.row, selected.col)] ?? "");
+          }
+          return true;
+        case "edit.fillDown": {
+          if (!sheetApi.editable) return true;
+          const range = sheetApi.targetRange();
+          const source = { ...range, r1: range.r0 };
+          const target = range.r1 > range.r0 ? range : { ...range, r1: Math.min(sheetApi.state.rows - 1, range.r0 + 1) };
+          if (target.r1 > target.r0) sheetApi.fillRange(source, target, { series: false, format: true });
+          return true;
+        }
+        case "edit.fillRight": {
+          if (!sheetApi.editable) return true;
+          const range = sheetApi.targetRange();
+          const source = { ...range, c1: range.c0 };
+          const target = range.c1 > range.c0 ? range : { ...range, c1: Math.min(sheetApi.state.cols - 1, range.c0 + 1) };
+          if (target.c1 > target.c0) sheetApi.fillRange(source, target, { series: false, format: true });
+          return true;
+        }
+        case "format.bold":
+          sheetApi.toggleStyle("bold");
+          return true;
+        case "format.italic":
+          sheetApi.toggleStyle("italic");
+          return true;
+        case "format.underline":
+          sheetApi.toggleStyle("underline");
+          return true;
+        case "format.strike":
+          sheetApi.toggleStyle("strike");
+          return true;
+        case "format.numFmt":
+          sheetApi.applyFormat({ numFmt: "number" });
+          return true;
+        case "format.percent":
+          sheetApi.applyFormat({ numFmt: "percent" });
+          return true;
+        case "format.borders":
+          sheetApi.applyFormat({ borders: { top: true, right: true, bottom: true, left: true } });
+          return true;
+        case "format.clear":
+          sheetApi.clearFormat();
+          return true;
+        case "formula.sum":
+          return insertAggregate("SUM");
+        case "formula.average":
+          return insertAggregate("AVERAGE");
+        case "formula.insert":
+          if (sheetApi.editable) sheetApi.startEdit(selected.row, selected.col, "=");
+          return true;
+        case "merge.merge":
+          sheetApi.mergeSelection();
+          return true;
+        case "merge.unmerge":
+          sheetApi.unmergeSelection();
+          return true;
+        case "row.insert":
+          sheetApi.insertRow();
+          return true;
+        case "row.delete":
+          sheetApi.deleteRow();
+          return true;
+        case "col.insert":
+          sheetApi.insertCol();
+          return true;
+        case "col.delete":
+          sheetApi.deleteCol();
+          return true;
+        case "view.freeze":
+          sheetApi.freeze();
+          return true;
+        case "view.settings":
+          setPanel("settings");
+          return true;
+        case "view.comments":
+          setPanel("comments");
+          return true;
+        case "view.versions":
+          setPanel("versions");
+          return true;
+        case "edit.find":
+        case "edit.replace":
+          setPanel("find");
+          return true;
+        default:
+          return false;
+      }
+    },
+    [insertAggregate, notify, sheetApi],
+  );
+
+  const testDingTalk = useCallback(async () => {
+    try {
+      await api.testDingTalk();
+      notify("钉钉测试消息已发送");
+    } catch (err) {
+      notify((err as Error).message);
+    }
+  }, [notify]);
 
   // 打开评论面板时刷新一次：成员列表与角标可能已被其他端的操作改变
   useEffect(() => {
@@ -178,6 +399,72 @@ export default function App() {
     return computeRowOrder(sheetApi.state.rows, sheetApi.state.cells, filters, valueFilters, sorts);
   }, [filters, valueFilters, sorts, sheetApi.state.rows, sheetApi.state.cells]);
 
+  // ---------------------------------------------- 查找与替换（REQ-111）
+  const [findOptions, setFindOptions] = useState<FindOptions>(DEFAULT_FIND_OPTIONS);
+  const [replacement, setReplacement] = useState("");
+  const [hitIndex, setHitIndex] = useState(-1);
+  const matcher = useMemo(() => compileMatcher(findOptions), [findOptions]);
+  const findError = matcher.error ? matcher.error.message : null;
+  const findHits = useMemo<FindHit[]>(() => {
+    const { rows, cols, cells } = sheetApi.state;
+    if (!findOptions.query) return [];
+    if (rowOrder) return findMatchesInOrder(cells, rows, cols, rowOrder, findOptions, FIND_LIMIT);
+    return findMatches(cells, rows, cols, findOptions, FIND_LIMIT);
+  }, [findOptions, sheetApi.state.cells, sheetApi.state.rows, sheetApi.state.cols, rowOrder]);
+  const findTruncated = findHits.length >= FIND_LIMIT;
+
+  useEffect(() => {
+    setHitIndex(findHits.length ? 0 : -1);
+  }, [findHits]);
+
+  const jumpToHit = useCallback(
+    (hit: FindHit) => {
+      sheetApi.select(hit.row, hit.col);
+      requestAnimationFrame(() => document.querySelector<HTMLElement>(".grid-shell")?.focus());
+    },
+    [sheetApi],
+  );
+
+  const findStep = useCallback(
+    (direction: 1 | -1) => {
+      if (!findHits.length) {
+        notify("没有匹配项");
+        return;
+      }
+      const index = nextHitIndex(findHits, sheetApi.state.selected, direction);
+      setHitIndex(index);
+      if (index >= 0) jumpToHit(findHits[index]);
+    },
+    [findHits, jumpToHit, notify, sheetApi.state.selected],
+  );
+
+  const findNext = useCallback(() => findStep(1), [findStep]);
+  const findPrev = useCallback(() => findStep(-1), [findStep]);
+
+  const replaceCurrent = useCallback(() => {
+    if (!sheetApi.editable) return;
+    const hit = findHits[hitIndex] ?? findHits[0];
+    if (!hit) {
+      notify("没有匹配项");
+      return;
+    }
+    const next = replaceInValue(hit.value, findOptions, replacement);
+    if (next === hit.value) return;
+    sheetApi.applyCellUpdates({ [cellKey(hit.row, hit.col)]: next });
+  }, [findHits, findOptions, hitIndex, notify, replacement, sheetApi]);
+
+  const replaceEverything = useCallback(() => {
+    if (!sheetApi.editable) return;
+    const { cells, rows, cols } = sheetApi.state;
+    const result = replaceAllInSheet(cells, rows, cols, findOptions, replacement, 5000);
+    if (!result.count) {
+      notify("没有可替换的内容");
+      return;
+    }
+    sheetApi.applyCellUpdates(result.updates);
+    notify(`已替换 ${result.count} 处${result.truncated ? "（达到上限，未处理完）" : ""}`);
+  }, [findOptions, notify, replacement, sheetApi]);
+
   /** 当前选区描述（工具栏显示，REQ-002/003 让用户确认选中的范围）。 */
   const rangeLabel = useMemo(() => {
     if (rangeInfo.kind === "all") return `全选 ${rangeInfo.rows}×${rangeInfo.cols}`;
@@ -271,6 +558,15 @@ export default function App() {
     // 单元格 / 矩形选区
     items.push(
       { key: "copy", label: "复制", hint: "Ctrl+C", onSelect: () => sheetApi.copySelection(false) },
+      {
+        key: "copy-image",
+        label: "复制为图片",
+        hint: "可直接粘到钉钉",
+        onSelect: () => {
+          sheetApi.copySelection(false, true);
+          notify("已复制为图片，可直接粘贴到钉钉");
+        },
+      },
       { key: "cut", label: "剪切", hint: "Ctrl+X", disabled: !editable, onSelect: () => sheetApi.copySelection(true) },
       sep("clip-sep"),
       {
@@ -318,6 +614,21 @@ export default function App() {
         onSelect: () => sheetApi.applyFormat({ borders: { top: false, right: false, bottom: false, left: false } }),
       },
       sep("struct-sep"),
+      {
+        key: "merge",
+        label: "合并单元格",
+        hint: "Ctrl+M",
+        disabled: !editable || (rangeInfo.rows === 1 && rangeInfo.cols === 1),
+        onSelect: () => sheetApi.mergeSelection(),
+      },
+      {
+        key: "unmerge",
+        label: sheetApi.activeMerge ? `取消合并（${regionLabel(sheetApi.activeMerge)}）` : "取消合并",
+        hint: "Ctrl+Shift+M",
+        disabled: !editable || !sheetApi.activeMerge,
+        onSelect: () => sheetApi.unmergeSelection(),
+      },
+      sep("merge-sep"),
       { key: "row-insert", label: "在选中行上方插入行", disabled: !editable, onSelect: () => sheetApi.insertRow() },
       { key: "row-delete", label: "删除选中行", disabled: !editable, danger: true, onSelect: () => sheetApi.deleteRow() },
       { key: "col-insert", label: "在选中列左侧插入列", disabled: !editable, onSelect: () => sheetApi.insertCol() },
@@ -339,8 +650,6 @@ export default function App() {
     );
     return items;
   }, [menu, rangeInfo.cols, rangeInfo.rows, selectedFormat.bold, sheetApi]);
-
-  const notify = useMemo(() => (message: string) => setToast(message), []);
 
   /**
    * 填充柄（REQ-006）：按住右下角小方块拖动。
@@ -545,6 +854,10 @@ export default function App() {
         onShowPermissions={() => setPanel(panel === "permissions" ? "none" : "permissions")}
         onShowComments={() => setPanel(panel === "comments" ? "none" : "comments")}
         onShowView={() => setPanel(panel === "view" ? "none" : "view")}
+        onShowFind={() => setPanel(panel === "find" ? "none" : "find")}
+        onShowSettings={() => setPanel(panel === "settings" ? "none" : "settings")}
+        findActive={panel === "find"}
+        settingsActive={panel === "settings"}
         commentCount={comments.openCount}
         viewActive={Boolean(filters.length || valueFilters.length || sorts.length)}
         canDeleteSheet={role === "owner" && Boolean(sheetApi.state.sheetId)}
@@ -647,6 +960,49 @@ export default function App() {
         />
       )}
 
+      {/* 查找与替换（REQ-111） */}
+      {panel === "find" && sheetApi.state.sheetId && (
+        <FindReplacePanel
+          options={findOptions}
+          onOptions={(patch) => setFindOptions((prev) => ({ ...prev, ...patch }))}
+          hits={findHits}
+          hitIndex={hitIndex}
+          truncated={findTruncated}
+          error={findError}
+          replacement={replacement}
+          onReplacement={setReplacement}
+          onFindNext={findNext}
+          onFindPrev={findPrev}
+          onReplaceOne={replaceCurrent}
+          onReplaceAll={replaceEverything}
+          onJump={jumpToHit}
+          onClose={() => setPanel("none")}
+          readOnly={!sheetApi.editable}
+          limit={FIND_LIMIT}
+        />
+      )}
+
+      {/* 个性化设置（REQ-110/112/115） */}
+      {panel === "settings" && (
+        <SettingsPanel
+          prefs={prefsApi.prefs}
+          commands={prefsApi.commands}
+          bindings={prefsApi.bindings}
+          loading={prefsApi.loading}
+          saving={prefsApi.saving}
+          error={prefsApi.error}
+          dingtalk={dingtalk}
+          canTestDingTalk={role === "owner"}
+          onSetKey={prefsApi.setKey}
+          onUpdate={prefsApi.update}
+          onResetShortcuts={prefsApi.resetShortcuts}
+          onSave={prefsApi.save}
+          onTestDingTalk={testDingTalk}
+          onClose={() => setPanel("none")}
+          onNotify={notify}
+        />
+      )}
+
       {sheetApi.state.loading && <div className="loading">加载中…</div>}
       {!sheetApi.state.loading && sheetApi.state.sheetId && (
         <Grid
@@ -693,6 +1049,12 @@ export default function App() {
           onFillMove={onFillMove}
           onFillEnd={onFillEnd}
           fillEnabled={sheetApi.editable}
+          merges={sheetApi.state.merges}
+          bindings={prefsApi.bindings}
+          commands={prefsApi.commands}
+          onCommand={runCommand}
+          enterDirection={prefsApi.prefs.enterDirection}
+          onCopySelection={() => sheetApi.copySelection(false)}
         />
       )}
       {!sheetApi.state.loading && !sheetApi.state.sheetId && (

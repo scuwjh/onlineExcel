@@ -1,9 +1,10 @@
 """Pydantic 请求/响应模型（接口契约见 docs/api-contract.md）。"""
 from __future__ import annotations
 
+import re
 from typing import Any, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class LoginRequest(BaseModel):
@@ -82,6 +83,68 @@ class CommentCreate(BaseModel):
 
 class CommentResolve(BaseModel):
     resolved: bool = True
+
+
+class PreferencesUpdate(BaseModel):
+    """个性化配置（REQ-110/112）：覆盖式写入，未知键原样保留。
+
+    服务端做类型/长度/枚举校验（见 :func:`validate_preferences`），
+    但不认识具体命令 ID —— 命令表由前端 `lib/shortcuts.ts` 维护。
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    # 字段故意用 Any：非法取值统一由 validate_preferences 给出中文 400，
+    # 而不是 pydantic 的 422 结构化报错（契约要求 invalid + 可直接展示的消息）。
+    shortcuts: Any = Field(default_factory=dict)
+    fillColors: Any = Field(default_factory=list)
+    highlightColors: Any = Field(default_factory=list)
+    enterDirection: Any = "down"
+
+
+#: 单用户可保存的常用颜色数量上限（键位 Ctrl+Alt+1..9 只覆盖 9 个，留余量）。
+MAX_PREF_COLORS = 24
+MAX_PREF_SHORTCUTS = 80
+ENTER_DIRECTIONS = ("down", "up", "left", "right", "none")
+_COLOR_PATTERN = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def validate_preferences(raw: dict) -> dict:
+    """校验并归一化个性化配置；非法时抛 ``ValueError``（消息可直接展示）。"""
+    if not isinstance(raw, dict):
+        raise ValueError("配置必须是对象")
+    prefs = dict(raw)
+
+    shortcuts = prefs.get("shortcuts", {})
+    if not isinstance(shortcuts, dict):
+        raise ValueError("shortcuts 必须是对象")
+    if len(shortcuts) > MAX_PREF_SHORTCUTS:
+        raise ValueError(f"快捷键最多 {MAX_PREF_SHORTCUTS} 条")
+    clean_shortcuts: dict = {}
+    for command, spec in shortcuts.items():
+        if not isinstance(command, str) or not isinstance(spec, str):
+            raise ValueError("快捷键必须是「命令 → 键位串」的字符串映射")
+        if len(command) > 64 or len(spec) > 40:
+            raise ValueError("快捷键命令或键位串过长")
+        clean_shortcuts[command] = spec
+    prefs["shortcuts"] = clean_shortcuts
+
+    for key in ("fillColors", "highlightColors"):
+        colors = prefs.get(key, [])
+        if not isinstance(colors, list):
+            raise ValueError(f"{key} 必须是数组")
+        if len(colors) > MAX_PREF_COLORS:
+            raise ValueError(f"{key} 最多 {MAX_PREF_COLORS} 个颜色")
+        for color in colors:
+            if not isinstance(color, str) or not _COLOR_PATTERN.match(color):
+                raise ValueError(f"{key} 只接受 #rrggbb 形式的颜色")
+        prefs[key] = [str(color).lower() for color in colors]
+
+    direction = prefs.get("enterDirection", "down")
+    if direction not in ENTER_DIRECTIONS:
+        raise ValueError("enterDirection 只能是 " + "/".join(ENTER_DIRECTIONS))
+    prefs["enterDirection"] = direction
+    return prefs
 
 
 class XlsxImportRequest(BaseModel):

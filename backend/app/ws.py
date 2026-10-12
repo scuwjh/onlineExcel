@@ -24,7 +24,7 @@ from typing import Dict, Optional, Set
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from . import auth, config, crdt, store
+from . import auth, config, crdt, dingtalk, store
 from .db import get_conn, write_lock
 
 logger = logging.getLogger("online_excel.ws")
@@ -40,6 +40,11 @@ STRUCT_KINDS = {
     "col_insert": crdt.OP_INSERT_COL,
     "col_delete": crdt.OP_DELETE_COL,
 }
+#: 合并/取消合并（REQ-113）：与行列插删同一套协同语义，只是载荷是"区域"。
+MERGE_KINDS = {
+    "merge": crdt.OP_MERGE,
+    "unmerge": crdt.OP_UNMERGE,
+}
 BROADCAST_TYPES = {
     crdt.OP_SET_CELL: "cell_update",
     crdt.OP_SET_FORMAT: "cell_format",
@@ -47,6 +52,8 @@ BROADCAST_TYPES = {
     crdt.OP_DELETE_ROW: "row_delete",
     crdt.OP_INSERT_COL: "col_insert",
     crdt.OP_DELETE_COL: "col_delete",
+    crdt.OP_MERGE: "merge",
+    crdt.OP_UNMERGE: "unmerge",
     crdt.OP_REPLACE: "sheet_import",
 }
 
@@ -131,6 +138,46 @@ def _structural_payload(kind: str, msg: dict, state: crdt.SheetState, client_id:
     return {"element_id": target}
 
 
+def _merge_payload(kind: str, msg: dict, state: crdt.SheetState) -> dict:
+    """把合并/取消合并请求归一化为元素 ID 载荷（索引仅作历史回退）。"""
+    if kind == crdt.OP_UNMERGE:
+        row_id = msg.get("row_id")
+        col_id = msg.get("col_id")
+        if row_id is None or col_id is None:
+            row = msg.get("row")
+            col = msg.get("col")
+            if row is None or col is None:
+                raise crdt.InvalidOperation("取消合并需要 row_id/col_id 或 row/col")
+        payload: dict = {}
+        if row_id is not None:
+            payload["row_id"] = str(row_id)
+        if col_id is not None:
+            payload["col_id"] = str(col_id)
+        if msg.get("row") is not None:
+            payload["row"] = int(msg["row"])
+        if msg.get("col") is not None:
+            payload["col"] = int(msg["col"])
+        return payload
+
+    keys = (
+        ("row_start_id", "r0_id", "r0"),
+        ("col_start_id", "c0_id", "c0"),
+        ("row_end_id", "r1_id", "r1"),
+        ("col_end_id", "c1_id", "c1"),
+    )
+    payload = {}
+    for id_key, alt_id_key, index_key in keys:
+        value = msg.get(id_key, msg.get(alt_id_key))
+        index = msg.get(index_key)
+        if value is None and index is None:
+            raise crdt.InvalidOperation(f"合并区域缺少 {id_key}（或 {index_key}）")
+        if value is not None:
+            payload[id_key] = str(value)
+        if index is not None:
+            payload[index_key] = int(index)
+    return payload
+
+
 def _fits(message: dict) -> bool:
     """消息是否在单帧体积上限内（超限则退化为元数据 + 客户端 REST 拉取）。"""
     return len(json.dumps(message, ensure_ascii=False)) <= config.MAX_WS_MESSAGE_CHARS
@@ -175,6 +222,7 @@ async def sheet_ws(websocket: WebSocket, sheet_id: str) -> None:
             "colIds": state.col_ids,
             "cells": projection["cells"],
             "formats": projection["formats"],
+            "merges": projection.get("merges") or [],
             "users": manager.online_users(sheet_id),
         }
         if not _fits(welcome):
@@ -250,8 +298,22 @@ async def sheet_ws(websocket: WebSocket, sheet_id: str) -> None:
                     sheet_id,
                     {"type": "comment_added", "comment": comment, "counts": counts, "mentions": mentions},
                 )
+                # 钉钉提醒（REQ-115）：后台线程投递，失败不影响评论写入与广播。
+                try:
+                    cell_label = crdt.cell_ref(
+                        state.row_index(str(row_id)), state.col_index(str(col_id))
+                    )
+                except crdt.InvalidOperation:
+                    cell_label = ""
+                dingtalk.notify_in_background(
+                    sheet_name=state.name,
+                    author=username,
+                    body=body_text,
+                    mentioned_users=mentions,
+                    cell_label=cell_label,
+                )
                 continue
-            if mtype not in WRITE_KINDS and mtype not in STRUCT_KINDS:
+            if mtype not in WRITE_KINDS and mtype not in STRUCT_KINDS and mtype not in MERGE_KINDS:
                 await manager.send(
                     websocket, {"type": "error", "code": "invalid", "message": f"未知消息类型: {mtype}"}
                 )
@@ -275,6 +337,9 @@ async def sheet_ws(websocket: WebSocket, sheet_id: str) -> None:
                 if mtype in STRUCT_KINDS:
                     kind = STRUCT_KINDS[mtype]
                     payload = _structural_payload(kind, msg, state, client_id, counter)
+                elif mtype in MERGE_KINDS:
+                    kind = MERGE_KINDS[mtype]
+                    payload = _merge_payload(kind, msg, state)
                 else:
                     kind = WRITE_KINDS[mtype]
                     payload = _cell_payload(mtype, msg, state)
@@ -303,6 +368,7 @@ async def sheet_ws(websocket: WebSocket, sheet_id: str) -> None:
                         "colIds": result.get("colIds"),
                         "cells": result.get("cells", {}),
                         "formats": result.get("formats", {}),
+                        "merges": result.get("merges", []),
                     }
                 )
             elif kind in (crdt.OP_SET_CELL, crdt.OP_SET_FORMAT):
@@ -318,6 +384,7 @@ async def sheet_ws(websocket: WebSocket, sheet_id: str) -> None:
                         "cols": result.get("cols"),
                         "cells": result.get("cells", {}),
                         "formats": result.get("formats", {}),
+                        "merges": result.get("merges", []),
                     }
                 )
             else:
@@ -332,6 +399,8 @@ async def sheet_ws(websocket: WebSocket, sheet_id: str) -> None:
                         # 结构变化会影响所有单元格坐标，随广播带上权威投影，避免各端漂移。
                         "cells": result.get("cells", {}),
                         "formats": result.get("formats", {}),
+                        # 合并区域（REQ-113）随结构/投影一起下发，客户端无需额外拉取。
+                        "merges": result.get("merges", []),
                     }
                 )
 
@@ -354,6 +423,8 @@ async def sheet_ws(websocket: WebSocket, sheet_id: str) -> None:
                     "format": message.get("format"),
                     "at": message.get("at"),
                     "element_id": message.get("element_id"),
+                    # 合并区域很小：即使瘦身也带上，避免各端在 REST 拉取完成前闪回未合并状态。
+                    "merges": result.get("merges", []),
                 }
                 message = {k: v for k, v in slim.items() if v is not None}
 

@@ -28,9 +28,13 @@ OP_DELETE_COL = "delete_col"
 OP_SET_CELL = "set_cell"
 OP_SET_FORMAT = "set_format"
 OP_REPLACE = "replace"
+# 合并单元格（REQ-113）：区域状态按行/列元素 ID 锚定，与行列插删同一套协同语义。
+OP_MERGE = "merge"
+OP_UNMERGE = "unmerge"
 STRUCTURAL_KINDS = (OP_INSERT_ROW, OP_DELETE_ROW, OP_INSERT_COL, OP_DELETE_COL)
+MERGE_KINDS = (OP_MERGE, OP_UNMERGE)
 CELL_KINDS = (OP_SET_CELL, OP_SET_FORMAT)
-OP_KINDS = STRUCTURAL_KINDS + CELL_KINDS + (OP_REPLACE,)
+OP_KINDS = STRUCTURAL_KINDS + MERGE_KINDS + CELL_KINDS + (OP_REPLACE,)
 
 
 class SheetNotFound(Exception):
@@ -179,6 +183,8 @@ class SheetState:
     col_ids: list = field(default_factory=list)
     values: dict = field(default_factory=dict)  # (row_id, col_id) -> Reg
     formats: dict = field(default_factory=dict)
+    #: 合并区域：``(r0_id, c0_id, r1_id, c1_id)``（左上角在前），元素 ID 锚定。
+    merges: list = field(default_factory=list)
     seq: int = 0
 
     # -- 查询 -------------------------------------------------------------
@@ -220,7 +226,21 @@ class SheetState:
                 formats[f"{r}{CELL_SEPARATOR}{c}"] = json.loads(reg.value)
             except (json.JSONDecodeError, TypeError):
                 continue
-        return {"cells": cells, "formats": formats, "rows": len(self.row_ids), "cols": len(self.col_ids)}
+        merges: list = []
+        for r0_id, c0_id, r1_id, c1_id in self.merges:
+            a, b = row_pos.get(r0_id), col_pos.get(c0_id)
+            d, e = row_pos.get(r1_id), col_pos.get(c1_id)
+            if a is None or b is None or d is None or e is None:
+                continue  # 端点元素已被删除 → 区域失效
+            merges.append({"r0": min(a, d), "c0": min(b, e), "r1": max(a, d), "c1": max(b, e)})
+        merges.sort(key=lambda item: (item["r0"], item["c0"], item["r1"], item["c1"]))
+        return {
+            "cells": cells,
+            "formats": formats,
+            "merges": merges,
+            "rows": len(self.row_ids),
+            "cols": len(self.col_ids),
+        }
 
     def structural_elements(self) -> list:
         out = [("row", i, rid) for i, rid in enumerate(self.row_ids)]
@@ -292,6 +312,12 @@ def apply_op(
     elif kind == OP_SET_FORMAT:
         _apply_cell(state, payload, seq=seq, client_id=client_id, version=version, is_format=True)
 
+    elif kind == OP_MERGE:
+        _apply_merge(state, payload)
+
+    elif kind == OP_UNMERGE:
+        _apply_unmerge(state, payload)
+
     elif kind == OP_REPLACE:
         _apply_replace(state, payload, seq=seq, client_id=client_id)
 
@@ -328,6 +354,85 @@ def _remove_element(state: SheetState, axis: str, element_id_value: str) -> None
         state.values.pop(key, None)
     for key in [k for k in state.formats if element_id_value in k]:
         state.formats.pop(key, None)
+    # 合并区域以端点元素 ID 锚定：端点被删则该区域失效（区域内部的插删不影响端点）。
+    state.merges = [region for region in state.merges if element_id_value not in region]
+
+
+def _resolve_element_id(state: SheetState, axis: str, id_value, index_value) -> str:
+    """把 ``element_id``（优先）或序号解析成当前的元素 ID。
+
+    与 :func:`_resolve_rowcol` 同理：历史重放时结构可能已被 ``replace`` 整体重建，
+    旧版本里的元素 ID 在新结构里并不存在，此时按序号回退。
+    """
+    ids = state.row_ids if axis == "row" else state.col_ids
+    if id_value is not None:
+        value = str(id_value)
+        if value in ids:
+            return value
+    try:
+        at = int(index_value) if index_value is not None else None
+    except (TypeError, ValueError):
+        at = None
+    if at is not None and 0 <= at < len(ids):
+        return ids[at]
+    label = "行" if axis == "row" else "列"
+    raise InvalidOperation(f"{label}不存在: {id_value if id_value is not None else index_value}")
+
+
+def _region_intersects(state: SheetState, a: tuple, b: tuple) -> bool:
+    ar0, ac0, ar1, ac1 = state.row_index(a[0]), state.col_index(a[1]), state.row_index(a[2]), state.col_index(a[3])
+    br0, bc0, br1, bc1 = state.row_index(b[0]), state.col_index(b[1]), state.row_index(b[2]), state.col_index(b[3])
+    return not (ar1 < br0 or br1 < ar0 or ac1 < bc0 or bc1 < ac0)
+
+
+def _region_positions(state: SheetState, region: tuple) -> tuple:
+    return (
+        state.row_index(region[0]),
+        state.col_index(region[1]),
+        state.row_index(region[2]),
+        state.col_index(region[3]),
+    )
+
+
+def _apply_merge(state: SheetState, payload: dict) -> None:
+    """合并区域（REQ-113）。
+
+    载荷支持元素 ID（``row_start_id``/``col_start_id``/``row_end_id``/``col_end_id``，
+    或 ``r0_id``..\ ``c1_id``）与索引回退（``r0``/``c0``/``r1``/``c1``）。
+    与已有区域相交时先取消旧区域再合并，保证幂等；区域至少 2 格。
+    """
+    r0 = _resolve_element_id(state, "row", payload.get("row_start_id", payload.get("r0_id")), payload.get("r0"))
+    r1 = _resolve_element_id(state, "row", payload.get("row_end_id", payload.get("r1_id")), payload.get("r1"))
+    c0 = _resolve_element_id(state, "col", payload.get("col_start_id", payload.get("c0_id")), payload.get("c0"))
+    c1 = _resolve_element_id(state, "col", payload.get("col_end_id", payload.get("c1_id")), payload.get("c1"))
+    if state.row_index(r0) > state.row_index(r1):
+        r0, r1 = r1, r0
+    if state.col_index(c0) > state.col_index(c1):
+        c0, c1 = c1, c0
+    span_rows = state.row_index(r1) - state.row_index(r0) + 1
+    span_cols = state.col_index(c1) - state.col_index(c0) + 1
+    if span_rows * span_cols < 2:
+        raise InvalidOperation("合并区域至少需要 2 个单元格")
+    region = (r0, c0, r1, c1)
+    kept = [item for item in state.merges if not _region_intersects(state, item, region)]
+    if region not in kept:
+        kept.append(region)
+    state.merges = kept
+
+
+def _apply_unmerge(state: SheetState, payload: dict) -> None:
+    """取消包含目标单元格的合并区域；目标未合并时为无操作。"""
+    row_id = _resolve_element_id(state, "row", payload.get("row_id"), payload.get("row"))
+    col_id = _resolve_element_id(state, "col", payload.get("col_id"), payload.get("col"))
+    kept: list = []
+    for region in state.merges:
+        inside = (
+            state.row_index(region[0]) <= state.row_index(row_id) <= state.row_index(region[2])
+            and state.col_index(region[1]) <= state.col_index(col_id) <= state.col_index(region[3])
+        )
+        if not inside:
+            kept.append(region)
+    state.merges = kept
 
 
 def _resolve_rowcol(state: SheetState, payload: dict) -> tuple:
@@ -437,6 +542,25 @@ def _apply_replace(state: SheetState, payload: dict, *, seq: int, client_id: str
         state.formats[(state.row_ids[r], state.col_ids[c])] = Reg(
             value=json.dumps(fmt, ensure_ascii=False), version=dict(version), seq=seq, client=client_id
         )
+    # 合并区域随整体替换一起重建（版本恢复会带上原版本的 merges）。
+    state.merges = []
+    for item in payload.get("merges") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            r0 = int(item.get("r0"))
+            c0 = int(item.get("c0"))
+            r1 = int(item.get("r1"))
+            c1 = int(item.get("c1"))
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= r0 <= r1 < rows and 0 <= c0 <= c1 < cols):
+            continue
+        if (r1 - r0 + 1) * (c1 - c0 + 1) < 2:
+            continue
+        region = (state.row_ids[r0], state.col_ids[c0], state.row_ids[r1], state.col_ids[c1])
+        if region not in state.merges:
+            state.merges.append(region)
 
 
 # --------------------------------------------------------------------- 状态加载
@@ -504,10 +628,27 @@ def load_state(conn, sheet_id: str) -> SheetState:
         "SELECT COALESCE(MAX(seq), 0) AS seq FROM ops WHERE sheet_id = ?", (sheet_id,)
     ).fetchone()
     state.seq = int(seq_row["seq"] or 0)
+
+    # 合并区域（REQ-113）：与结构一样是派生状态，按元素 ID 读取。
+    for row in conn.execute(
+        "SELECT r0_id, c0_id, r1_id, c1_id FROM merges WHERE sheet_id = ? ORDER BY region_id",
+        (sheet_id,),
+    ):
+        region = (row["r0_id"], row["c0_id"], row["r1_id"], row["c1_id"])
+        if region not in state.merges:
+            state.merges.append(region)
     return state
 
 
-def state_from_projection(name: str, rows: int, cols: int, cells: dict, formats: dict, batch: str = "snapshot") -> SheetState:
+def state_from_projection(
+    name: str,
+    rows: int,
+    cols: int,
+    cells: dict,
+    formats: dict,
+    batch: str = "snapshot",
+    merges: Optional[list] = None,
+) -> SheetState:
     """由 ``project()`` 的产物反向构造状态（快照恢复用）。"""
     state = SheetState(sheet_id="")
     state.name = name
@@ -529,6 +670,21 @@ def state_from_projection(name: str, rows: int, cols: int, cells: dict, formats:
             state.formats[(state.row_ids[r], state.col_ids[c])] = Reg(
                 value=json.dumps(fmt, ensure_ascii=False)
             )
+    for item in merges or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            r0 = int(item.get("r0"))
+            c0 = int(item.get("c0"))
+            r1 = int(item.get("r1"))
+            c1 = int(item.get("c1"))
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= r0 <= r1 < rows and 0 <= c0 <= c1 < cols):
+            continue
+        if (r1 - r0 + 1) * (c1 - c0 + 1) < 2:
+            continue
+        state.merges.append((state.row_ids[r0], state.col_ids[c0], state.row_ids[r1], state.col_ids[c1]))
     return state
 
 
@@ -574,6 +730,8 @@ def normalize_legacy_snapshot(data) -> Optional[dict]:
             "cols": _safe_int(data.get("cols")),
             "cells": dict(data.get("cells") or {}),
             "formats": dict(data.get("formats") or {}),
+            # 合并区域（REQ-113）随快照一起保留，否则压缩点之后合并会"消失"。
+            "merges": list(data.get("merges") or []),
         }
     if not isinstance(data, list):
         return None
@@ -623,6 +781,7 @@ def state_to_ops(state: SheetState, *, seq: int, client_id: str) -> list:
                 "cols": cols,
                 "cells": projection["cells"],
                 "formats": projection["formats"],
+                "merges": projection.get("merges") or [],
                 "client": client_id,
             },
             {},

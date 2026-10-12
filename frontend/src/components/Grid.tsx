@@ -9,11 +9,13 @@
  *   ``top`` 固定，非冻结行按 ``top = 表头高 + 累计偏移 - scrollTop`` 定位。
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { CellFormat, Cells, Cursor } from "../types";
+import type { CellFormat, Cells, Cursor, EnterDirection, MergeRegion } from "../types";
 import { COL_W, HEADER_H, ROW_H, ROW_HEAD_W } from "../types";
 import { cellKey, colLabel } from "../lib/gridUtils";
 import { evaluate } from "../lib/formula";
 import { formatCellDisplay } from "../lib/cellDisplay";
+import { hiddenCells, regionKey } from "../lib/merge";
+import { matchesBinding, type CommandDef } from "../lib/shortcuts";
 import type { SelectionKind } from "../hooks/useSheet";
 
 interface Props {
@@ -81,6 +83,18 @@ interface Props {
   rowIds?: string[];
   colIds?: string[];
   onOpenComments?: (row: number, col: number) => void;
+  /** 合并区域（REQ-113）：非左上角单元格的内容会被隐藏，区域用覆盖层绘制。 */
+  merges?: MergeRegion[];
+  /** 个性化快捷键（REQ-110）：命令 ID → 键位串；命中时交给 onCommand。 */
+  bindings?: Record<string, string>;
+  /** 生效的命令表（含用户自定义颜色类命令），顺序即匹配优先级。 */
+  commands?: CommandDef[];
+  /** 命中快捷键后由父组件执行命令；返回 false 表示"未处理"，网格继续走默认逻辑。 */
+  onCommand?: (commandId: string) => boolean;
+  /** Enter 提交后的跳转方向（REQ-112）。 */
+  enterDirection?: EnterDirection;
+  /** 复制选区（带图片，REQ-114）：Ctrl+C 走这里以便复制整块选区。 */
+  onCopySelection?: () => void;
 }
 
 interface ViewWindow {
@@ -94,6 +108,22 @@ interface ViewWindow {
 
 const OVERSCAN_ROWS = 8;
 const OVERSCAN_COLS = 3;
+
+/** Shift+Enter 使用相反方向（REQ-112）；``none`` 保持原处。 */
+function oppositeDirection(direction: EnterDirection): EnterDirection {
+  switch (direction) {
+    case "up":
+      return "down";
+    case "down":
+      return "up";
+    case "left":
+      return "right";
+    case "right":
+      return "left";
+    default:
+      return "none";
+  }
+}
 
 export default function Grid(props: Props) {
   const {
@@ -144,6 +174,9 @@ export default function Grid(props: Props) {
     [range],
   );
 
+  /** 合并区域（REQ-113）里"非左上角"的单元格：内容由覆盖层绘制，这里只留占位。 */
+  const mergedHidden = useMemo(() => hiddenCells(props.merges ?? []), [props.merges]);
+
   const scrollRef = useRef<HTMLDivElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -162,6 +195,31 @@ export default function Grid(props: Props) {
   const order = props.rowOrder && props.rowOrder.length !== rows ? props.rowOrder : props.rowOrder;
   const viewHeight = order ? order.length : rows;
   const rowAt = useCallback((slot: number) => (order ? order[slot] : slot), [order]);
+
+  /** Enter 提交后的落点（REQ-112）：上下按展示序走，被筛选的行自动跳过。 */
+  const moveByDirection = useCallback(
+    (direction: EnterDirection, row: number, col: number): { row: number; col: number } | null => {
+      const stepRow = (delta: number): number => {
+        if (!order) return Math.max(0, Math.min(rows - 1, row + delta));
+        const slot = order.indexOf(row);
+        const next = Math.max(0, Math.min(order.length - 1, (slot < 0 ? 0 : slot) + delta));
+        return order[next] ?? row;
+      };
+      switch (direction) {
+        case "down":
+          return { row: stepRow(1), col };
+        case "up":
+          return { row: stepRow(-1), col };
+        case "left":
+          return { row, col: Math.max(0, col - 1) };
+        case "right":
+          return { row, col: Math.min(cols - 1, col + 1) };
+        default:
+          return null;
+      }
+    },
+    [order, rows, cols],
+  );
 
   const measure = useCallback(() => {
     const el = scrollRef.current;
@@ -272,6 +330,22 @@ export default function Grid(props: Props) {
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       const { row, col } = selected;
+      // 正在输入框/公式栏里打字时不做快捷键分发（否则会吞掉输入）
+      const target = e.target as HTMLElement | null;
+      const typing =
+        !!target &&
+        (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable === true);
+      if (!typing) {
+        // 个性化快捷键（REQ-110）：按命令表顺序匹配，命中即交给父组件执行
+        for (const command of props.commands ?? []) {
+          const spec = (props.bindings ?? {})[command.id];
+          if (!spec) continue;
+          if (!matchesBinding(spec, e.nativeEvent)) continue;
+          e.preventDefault();
+          if (props.onCommand?.(command.id)) return;
+          break;
+        }
+      }
       if (e.ctrlKey || e.metaKey) {
         const key = e.key.toLowerCase();
         if (key === "a") {
@@ -642,6 +716,14 @@ export default function Grid(props: Props) {
           e.preventDefault();
           committedRef.current = true;
           props.onCommit(selected.row, selected.col, text);
+          // REQ-112：提交后按用户设置的 Enter 方向跳转（Shift+Enter 反向；none 停在原处）
+          const base: EnterDirection = props.enterDirection ?? "down";
+          const direction: EnterDirection = e.shiftKey ? oppositeDirection(base) : base;
+          const next = moveByDirection(direction, selected.row, selected.col);
+          if (next) {
+            props.onMove(next.row, next.col);
+            scrollIntoView(next.row, next.col);
+          }
           focusShellRef.current?.();
         } else if (e.key === "Escape") {
           e.preventDefault();
@@ -722,15 +804,17 @@ export default function Grid(props: Props) {
         // 评论角标：数量取自稳定元素 ID（row_id:col_id），行列插删后依然跟随
         const commentKey = `${rowIdsForComments[r] ?? ""}:${colIdsForComments[c] ?? ""}`;
         const commentCount = props.commentCounts?.[commentKey] ?? 0;
+        // 合并区域的非左上角单元格：内容由覆盖层绘制，这里只留底色占位（REQ-113）
+        const merged = mergedHidden.has(key);
         return (
           <GridCell
             key={key}
             row={r}
             col={c}
-            value={cells[key] ?? null}
+            value={merged ? null : cells[key] ?? null}
             style={cellStyle(formats[key], c < frozenCols, isSelected)}
-            fmt={formats[key]}
-            className={`cell${c < frozenCols ? " frozen" : ""}${isSelected ? " selected" : isInRange ? " in-range" : ""}`}
+            fmt={merged ? undefined : formats[key]}
+            className={`cell${c < frozenCols ? " frozen" : ""}${isSelected ? " selected" : isInRange ? " in-range" : ""}${merged ? " merged-hidden" : ""}`}
             remote={remote}
             cells={cells}
             commentCount={commentCount}
@@ -773,6 +857,129 @@ export default function Grid(props: Props) {
   const frozenViewportH = Math.max(0, size.height - HEADER_H);
   const frozenColsW = ROW_HEAD_W + frozenCols * COL_W;
   const frozenRowsH = frozenRows * ROW_H;
+
+  /**
+   * 合并区域覆盖层（REQ-113）。
+   *
+   * 一个合并区域可能跨冻结线，因此按"冻结行/冻结列"切成最多四块，分别画在
+   * 对应的层里（body / 冻结列 / 冻结行 / 左上角），坐标与该层的行盒保持一致；
+   * 只有**含左上角单元格的那一块**绘制内容与样式，其余块只画底色与边框，
+   * 视觉上仍是一整块。行定位用展示序（筛选/排序后依然对齐）；区域跨越了被
+   * 筛选掉的行、或行序不连续时不画覆盖层（退回普通单元格渲染，避免错位）。
+   */
+  const mergeOverlays = useMemo(() => {
+    type Block = { key: string; style: React.CSSProperties; text: string; fmt?: CellFormat };
+    const groups: {
+      body: Block[];
+      frozenCols: Block[];
+      frozenRows: Block[];
+      corner: Block[];
+    } = { body: [], frozenCols: [], frozenRows: [], corner: [] };
+
+    for (const region of props.merges ?? []) {
+      const { r0, c0, r1, c1 } = region;
+      const slots: number[] = [];
+      let contiguous = true;
+      for (let r = r0; r <= r1; r++) {
+        const slot = order ? order.indexOf(r) : r;
+        if (slot < 0) {
+          contiguous = false;
+          break;
+        }
+        slots.push(slot);
+      }
+      if (!contiguous) continue;
+      for (let i = 1; i < slots.length; i++) {
+        if (slots[i] !== slots[i - 1] + 1) {
+          contiguous = false;
+          break;
+        }
+      }
+      if (!contiguous) continue;
+
+      const anchorKey = cellKey(r0, c0);
+      const anchorText = formatCellDisplay(evaluate(cells[anchorKey] ?? "", cells), formats[anchorKey]);
+      const anchorFmt = formats[anchorKey];
+
+      const rowParts: Array<{ from: number; to: number; frozen: boolean }> = [];
+      if (frozenRows > 0 && r0 < frozenRows) {
+        rowParts.push({ from: r0, to: Math.min(r1, frozenRows - 1), frozen: true });
+      }
+      if (r1 >= frozenRows) rowParts.push({ from: Math.max(r0, frozenRows), to: r1, frozen: false });
+      const colParts: Array<{ from: number; to: number; frozen: boolean }> = [];
+      if (frozenCols > 0 && c0 < frozenCols) {
+        colParts.push({ from: c0, to: Math.min(c1, frozenCols - 1), frozen: true });
+      }
+      if (c1 >= frozenCols) colParts.push({ from: Math.max(c0, frozenCols), to: c1, frozen: false });
+
+      for (const rowPart of rowParts) {
+        for (const colPart of colParts) {
+          const layer = rowPart.frozen
+            ? colPart.frozen
+              ? "corner"
+              : "frozenRows"
+            : colPart.frozen
+              ? "frozenCols"
+              : "body";
+          const width = (colPart.to - colPart.from + 1) * COL_W;
+          const height = (rowPart.to - rowPart.from + 1) * ROW_H;
+          const top =
+            layer === "corner" || layer === "frozenRows"
+              ? rowPart.from * ROW_H
+              : HEADER_H + orderIndexOf(rowPart.from) * ROW_H - view.scrollTop;
+          const left = colPart.frozen
+            ? ROW_HEAD_W + colPart.from * COL_W
+            : ROW_HEAD_W + frozenCols * COL_W + leftPad + (colPart.from - view.colStart) * COL_W;
+          const hasAnchor = colPart.from === c0 && rowPart.from === r0;
+          groups[layer].push({
+            key: `${regionKey(region)}:${layer}:${rowPart.from}:${colPart.from}`,
+            style: {
+              position: "absolute",
+              top,
+              left,
+              width,
+              height,
+              zIndex: 5,
+              background: anchorFmt?.bg || "#fff",
+              border: "1px solid #5b6b7c",
+              display: "flex",
+              alignItems: anchorFmt?.valign === "top" ? "flex-start" : anchorFmt?.valign === "bottom" ? "flex-end" : "center",
+              justifyContent:
+                anchorFmt?.align === "center" ? "center" : anchorFmt?.align === "right" ? "flex-end" : "flex-start",
+              padding: "0 6px",
+              boxSizing: "border-box",
+              overflow: "hidden",
+              whiteSpace: "nowrap",
+              fontWeight: anchorFmt?.bold ? 700 : undefined,
+              fontStyle: anchorFmt?.italic ? "italic" : undefined,
+              textDecoration:
+                [anchorFmt?.underline ? "underline" : "", anchorFmt?.strike ? "line-through" : ""]
+                  .filter(Boolean)
+                  .join(" ") || undefined,
+              color: anchorFmt?.color || undefined,
+              fontSize: anchorFmt?.size ? `${anchorFmt.size}px` : undefined,
+              pointerEvents: hasAnchor ? "auto" : "none",
+            },
+            text: hasAnchor ? anchorText : "",
+            fmt: anchorFmt,
+          });
+        }
+      }
+    }
+    return groups;
+  }, [
+    props.merges,
+    cells,
+    formats,
+    order,
+    frozenRows,
+    frozenCols,
+    leftPad,
+    view.colStart,
+    view.scrollTop,
+    orderIndexOf,
+    ROW_HEAD_W,
+  ]);
 
   return (
     <div
@@ -858,6 +1065,12 @@ export default function Grid(props: Props) {
                 </div>
               );
             })}
+            {/* 合并区域（REQ-113）：位于滚动区的块 */}
+            {mergeOverlays.body.map((block) => (
+              <div key={block.key} className="merge-overlay" style={block.style} data-merge="1">
+                {block.text}
+              </div>
+            ))}
           </div>
 
           {/* 左侧冻结列层：钉在视口左侧，覆盖表头 + 表体（行内容随纵向滚动裁切） */}
@@ -912,6 +1125,12 @@ export default function Grid(props: Props) {
                   </div>
                 );
               })}
+              {/* 合并区域（REQ-113）：冻结列层里的块 */}
+              {mergeOverlays.frozenCols.map((block) => (
+                <div key={block.key} className="merge-overlay" style={block.style} data-merge="1">
+                  {block.text}
+                </div>
+              ))}
             </div>
           )}
 
@@ -945,6 +1164,12 @@ export default function Grid(props: Props) {
                   {rightPad > 0 && <div className="grid-spacer" style={{ width: rightPad }} />}
                 </div>
               ))}
+              {/* 合并区域（REQ-113）：冻结行层里的块 */}
+              {mergeOverlays.frozenRows.map((block) => (
+                <div key={block.key} className="merge-overlay" style={block.style} data-merge="1">
+                  {block.text}
+                </div>
+              ))}
             </div>
           )}
 
@@ -973,6 +1198,12 @@ export default function Grid(props: Props) {
                     {r + 1}
                   </div>
                   {renderCells(r, frozenColList, 0)}
+                </div>
+              ))}
+              {/* 合并区域（REQ-113）：左上角（冻结行 × 冻结列）的块 */}
+              {mergeOverlays.corner.map((block) => (
+                <div key={block.key} className="merge-overlay" style={block.style} data-merge="1">
+                  {block.text}
                 </div>
               ))}
             </div>

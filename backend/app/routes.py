@@ -15,7 +15,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
-from . import auth, config, crdt, store, xlsx
+from . import auth, config, crdt, dingtalk, store, xlsx
 from .db import get_conn, write_lock
 from .schemas import (
     CellsUpdateRequest,
@@ -25,11 +25,13 @@ from .schemas import (
     LoginRequest,
     OperationRequest,
     PermissionRequest,
+    PreferencesUpdate,
     RowColRequest,
     SheetCreate,
     SheetRename,
     XlsxExportRequest,
     XlsxImportRequest,
+    validate_preferences,
 )
 
 router = APIRouter(prefix="/api")
@@ -252,7 +254,15 @@ def update_formats(sheet_id: str, body: CellsUpdateRequest, user: dict = Depends
 @router.post("/sheets/{sheet_id}/ops")
 def apply_operation(sheet_id: str, body: OperationRequest, user: dict = Depends(current_user)):
     """通用操作入口（幂等重放/离线补偿用）。"""
-    kinds = {crdt.OP_INSERT_ROW, crdt.OP_DELETE_ROW, crdt.OP_INSERT_COL, crdt.OP_DELETE_COL}
+    kinds = {
+        crdt.OP_INSERT_ROW,
+        crdt.OP_DELETE_ROW,
+        crdt.OP_INSERT_COL,
+        crdt.OP_DELETE_COL,
+        # 合并/取消合并（REQ-113）走同一个通用入口
+        crdt.OP_MERGE,
+        crdt.OP_UNMERGE,
+    }
     if body.kind not in kinds:
         raise HTTPException(status_code=400, detail=f"该接口不支持操作: {body.kind}")
     payload = dict(body.payload)
@@ -393,6 +403,8 @@ def restore_version(sheet_id: str, version_id: int, user: dict = Depends(current
             # 保留原版本的行列元素 ID：评论等按元素 ID 锚定的数据不会因恢复而失效（REQ-042）
             row_ids=state.row_ids,
             col_ids=state.col_ids,
+            # 合并区域（REQ-113）随版本一起恢复
+            merges=projection.get("merges") or [],
         )
     except crdt.InvalidOperation as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -624,6 +636,14 @@ def create_comment(sheet_id: str, body: CommentCreate, user: dict = Depends(curr
         sheet_id,
         {"type": "comment_added", "comment": comment, "counts": counts, "mentions": mentions},
     )
+    # 钉钉提醒（REQ-115）：后台线程投递，未配置/失败都不影响评论写入。
+    dingtalk.notify_in_background(
+        sheet_name=state.name,
+        author=user["username"],
+        body=body.body,
+        mentioned_users=mentions,
+        cell_label=crdt.cell_ref(state.row_index(row_id), state.col_index(col_id)),
+    )
     return {"ok": True, "data": {"comment": comment, "counts": counts, "mentions": mentions}}
 
 
@@ -694,3 +714,60 @@ def delete_comment(sheet_id: str, comment_id: int, user: dict = Depends(current_
         conn.commit()
         counts = store.comment_counts(conn, sheet_id)
     return {"ok": True, "data": {"deleted": (removed or {}).get("id"), "counts": counts}}
+
+
+# ------------------------------------------------------------------- 个性化偏好
+
+
+@router.get("/preferences")
+def get_preferences(user: dict = Depends(current_user)):
+    """当前用户的个性化配置（REQ-110/112）；未设置过返回空对象，由前端补默认值。"""
+    conn = get_conn()
+    return {"ok": True, "data": store.get_preferences(conn, user["id"])}
+
+
+@router.put("/preferences")
+def put_preferences(body: PreferencesUpdate, user: dict = Depends(current_user)):
+    """覆盖式保存个性化配置（快捷键 / 常用颜色 / Enter 跳转方向）。"""
+    try:
+        prefs = validate_preferences(body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    conn = get_conn()
+    with write_lock:
+        try:
+            store.save_preferences(conn, user["id"], prefs)
+        except crdt.InvalidOperation as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        conn.commit()
+    return {"ok": True, "data": prefs}
+
+
+# ------------------------------------------------------------------- 钉钉集成
+
+
+@router.get("/integrations/dingtalk")
+def dingtalk_status(user: dict = Depends(current_user)):
+    """钉钉机器人集成状态（不返回 webhook / secret）。"""
+    return {"ok": True, "data": dingtalk.status()}
+
+
+@router.post("/integrations/dingtalk/test")
+def dingtalk_test(user: dict = Depends(current_user)):
+    """发送一条测试消息：需调用者是任意一张表格的 owner。"""
+    conn = get_conn()
+    if store.owned_sheet_count(conn, user["id"]) <= 0:
+        raise HTTPException(status_code=403, detail="只有表格所有者可以测试钉钉机器人")
+    cfg = dingtalk.load_config()
+    if not cfg.configured:
+        raise HTTPException(
+            status_code=400,
+            detail="未配置钉钉机器人（需 OE_DINGTALK_ENABLED=1 且 OE_DINGTALK_WEBHOOK）",
+        )
+    result = dingtalk.send_text(
+        f"【表格提醒】在线表格钉钉机器人测试消息（{user['username']}）", cfg=cfg
+    )
+    if not result.get("ok"):
+        detail = result.get("errmsg") or result.get("error") or result.get("skipped") or "发送失败"
+        raise HTTPException(status_code=400, detail=detail)
+    return {"ok": True, "data": result}

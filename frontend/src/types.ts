@@ -98,6 +98,8 @@ export interface SheetData {
   name: string;
   cells: Cells;
   formats: Record<string, CellFormat>;
+  /** 合并区域（0 基下标、含端点）；服务端以稳定元素 ID 存，投影时已解析为下标。 */
+  merges: MergeRegion[];
   version: number;
   seq: number;
   rows: number;
@@ -107,6 +109,58 @@ export interface SheetData {
   colIds: string[];
   role: Role | null;
 }
+
+/** 合并区域：0 基下标、含端点，保证 r0<=r1 且 c0<=c1。 */
+export interface MergeRegion {
+  r0: number;
+  c0: number;
+  r1: number;
+  c1: number;
+}
+
+/** Enter 提交后活动单元格的跳转方向（REQ-112）。 */
+export type EnterDirection = "down" | "up" | "left" | "right" | "none";
+
+/** 按用户保存的个性化配置（REQ-110/112），服务端 user_preferences 一行一用户。 */
+export interface UserPreferences {
+  /** 命令 ID → 键位串（如 `Ctrl+B`、`Alt+1`）；只保存与默认表不同的差异。 */
+  shortcuts: Record<string, string>;
+  /** 常用填色（`#rrggbb`），顺序对应 `Ctrl+Alt+1..9`。 */
+  fillColors: string[];
+  /** 常用高亮（文字色）。 */
+  highlightColors: string[];
+  enterDirection: EnterDirection;
+}
+
+export const ENTER_DIRECTIONS: Array<{ value: EnterDirection; label: string }> = [
+  { value: "down", label: "向下" },
+  { value: "up", label: "向上" },
+  { value: "left", label: "向左" },
+  { value: "right", label: "向右" },
+  { value: "none", label: "停在原处" },
+];
+
+/** 内置填色板（与工具栏常用色一致）。 */
+export const DEFAULT_FILL_COLORS = [
+  "#fff2cc",
+  "#fce4d6",
+  "#e2efda",
+  "#deebf7",
+  "#e4dfec",
+  "#ffd966",
+  "#f8cbad",
+  "#c6e0b4",
+];
+
+/** 内置高亮（文字色）板。 */
+export const DEFAULT_HIGHLIGHT_COLORS = ["#d93025", "#e37400", "#188038", "#1a73e8", "#9334e6", "#5f6368"];
+
+export const DEFAULT_PREFERENCES: UserPreferences = {
+  shortcuts: {},
+  fillColors: [...DEFAULT_FILL_COLORS],
+  highlightColors: [...DEFAULT_HIGHLIGHT_COLORS],
+  enterDirection: "down",
+};
 
 export interface Presence {
   user: string;

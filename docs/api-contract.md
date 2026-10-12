@@ -45,6 +45,10 @@ Authorization: Bearer <JWT>
   `base_rows` / `base_cols`（结构基线）、`user`、`message`、`created_at`。
 - `Comment`：`id`、`sheet_id`、`row_id` / `col_id`（**稳定元素 ID**，不是行号列号）、
   `author_id`、`author`、`body`、`mentions`（JSON 数组）、`resolved`、`created_at`。
+- `Merge`：合并区域，`sheet_id` + 四角**稳定元素 ID**（`r0_id`/`c0_id`/`r1_id`/`c1_id`，左上角在前）。
+  用元素 ID 而不是行号列号，插入/删除行列后合并区域自动跟随（在区域内部插行会自然扩展开）。
+- `UserPreferences`：按用户的个性化配置，`(user_id) → prefs`（JSON：快捷键、常用颜色、Enter 跳转方向）。
+  单用户一行，跨设备生效；未设置过的用户返回内置默认值。
 
 ## 3. REST API
 
@@ -55,7 +59,7 @@ Authorization: Bearer <JWT>
 | GET | `/api/config` | - | 非敏感运行时配置（行列表限、角色列表等） |
 | GET | `/api/sheets` | 认证 | 仅返回当前用户可见的表格 |
 | POST | `/api/sheets` | 认证 | 建表，body `{"name","rows","cols"}`（行/列按 `OE_MAX_ROWS`/`OE_MAX_COLS` 夹取） |
-| GET | `/api/sheets/{id}` | viewer | 表格全量数据（`cells`、`formats`、`rowIds`、`colIds`、`version`、`seq`、`role`） |
+| GET | `/api/sheets/{id}` | viewer | 表格全量数据（`cells`、`formats`、`merges`、`rowIds`、`colIds`、`version`、`seq`、`role`） |
 | PATCH | `/api/sheets/{id}` | owner | 改名 |
 | GET | `/api/sheets/{id}/access` | viewer | 当前用户的能力说明 |
 | PUT | `/api/sheets/{id}/cells` | editor | 批量写单元格，body `{"updates":[{"row_id","col_id","value"}], "version":{clientId:seq}}` |
@@ -75,7 +79,7 @@ Authorization: Bearer <JWT>
 
 区域格式由前端展开成多条 `cell_format` 广播（同一个 `version`）；整行/整列选中时展开为该行/列的所有单元格。
 导出 xlsx 时会映射成 Excel 的字体/边框/数字格式（`¥#,##0.00`、`0.00%`、`yyyy-mm-dd` 等）。
-| POST | `/api/sheets/{id}/ops` | editor | 通用结构操作（`insert_row`/`delete_row`/`insert_col`/`delete_col`） |
+| POST | `/api/sheets/{id}/ops` | editor | 通用结构操作（`insert_row`/`delete_row`/`insert_col`/`delete_col`/`merge`/`unmerge`） |
 | POST | `/api/sheets/{id}/rows` | editor | 插入行，body `{"at","counter"}` |
 | DELETE | `/api/sheets/{id}/rows/{at}` | editor | 删除行 |
 | POST | `/api/sheets/{id}/cols` | editor | 插入列 |
@@ -98,6 +102,10 @@ Authorization: Bearer <JWT>
 | POST | `/api/sheets/{id}/comments` | commenter | 发表评论；body `{"row_id","col_id","body"}`，服务端解析并校验 `@提及` |
 | POST | `/api/sheets/{id}/comments/{cid}/resolve` | commenter | 标记解决/重新打开；body `{"resolved": bool}` |
 | DELETE | `/api/sheets/{id}/comments/{cid}` | commenter | 删除评论（作者本人，或 editor/owner） |
+| GET | `/api/preferences` | 认证 | 当前用户的个性化配置（快捷键/常用颜色/Enter 方向），未设置返回默认值 |
+| PUT | `/api/preferences` | 认证 | 覆盖式保存个性化配置（整体写入，服务端校验键与取值，超大返回 `invalid`） |
+| GET | `/api/integrations/dingtalk` | 认证 | 钉钉机器人集成状态：`{enabled, configured, has_secret, mobile_map_size}`（**不返回 webhook 与 secret**） |
+| POST | `/api/integrations/dingtalk/test` | owner | 向机器人发一条测试消息；需调用者是**任意一张表格的 owner**；未配置返回 `invalid` |
 
 响应统一为 `{"ok": true, "data": ...}`；失败为
 `{"ok": false, "error": "...", "code": "unauthorized|forbidden|not_found|invalid|rate_limited|error"}`。
@@ -121,6 +129,51 @@ Authorization: Bearer <JWT>
 - 广播：REST 与 WebSocket 两条写入路径都会向同表格房间推送
   `comment_added` / `comment_updated`（含 `comment` 与权威 `counts`）。
 
+### 合并单元格（REQ-113）
+
+- 操作：`merge`（合并）与 `unmerge`（取消合并），走与行列插删相同的协同链路
+  （操作日志 → 增量版本 → 版本 diff → 撤销/重做 → WebSocket 广播 → 历史版本恢复）。
+- 载荷（元素 ID 优先，索引仅作兼容回退）：
+  - `merge`：`{"row_start_id","col_start_id","row_end_id","col_end_id"}`，或 `{"r0","c0","r1","c1"}` 索引形式；
+  - `unmerge`：`{"row_id","col_id"}`（或 `{"row","col"}`）——取消**包含该单元格**的整个合并区域。
+- 校验：区域必须是矩形且至少 2 个单元格；`merge` 与已有区域相交时，先自动取消相交的旧区域再合并（幂等）；
+  `unmerge` 落在未合并单元格上为无操作。
+- **不丢数据**：合并只记录区域，不清空区域内其它单元格的值与格式；渲染时非左上角单元格的内容被隐藏，
+  取消合并后原样恢复。因此复制合并区域只输出左上角的值。
+- 行/列插删的跟随规则：区域两端用元素 ID 锚定，在区域**内部**插入行列会自然扩展开；
+  删除区域端点所在行列会让该区域失效（投影时跳过，不再渲染）。
+- 投影：`GET /api/sheets/{id}`、`welcome`、结构类广播都会带权威 `merges`
+  （`[{"r0","c0","r1","c1"}]`，已解析为当前行/列下标；元素已失效的区域不出现）。
+
+### 个性化偏好（REQ-110 / REQ-112）
+
+- 存储：`user_preferences` 一行一用户，JSON 覆盖式写入；未设置过的用户返回内置默认值。
+- 字段（全部可选，服务端只做类型/长度/枚举校验，不认识的键原样保留）：
+  - `shortcuts`：`{命令ID: 键位串}`，键位串形如 `Ctrl+B`、`Ctrl+Shift+1`、`Alt+2`（≤80 条，单条 ≤40 字符）；
+  - `fillColors` / `highlightColors`：`#rrggbb` 数组（各 ≤24 个），顺序即快捷键 `Ctrl+Alt+1..9` 的绑定顺序；
+  - `enterDirection`：`down`（默认）/`up`/`left`/`right`/`none`；`Shift+Enter` 取反方向。
+- 快捷键命令 ID 是前后端约定的稳定标识（`format.bold`、`format.fill.<颜色>`、`formula.sum`、
+  `formula.average`、`edit.find`、`merge.merge` …），前端 `lib/shortcuts.ts` 内置默认表，
+  用户覆盖只保存差异；冲突时以命令表顺序为准并在设置面板提示。
+
+### 钉钉机器人（REQ-115）
+
+- 配置来自环境变量（不落库、不经接口下发，避免 webhook 泄漏）：
+  `OE_DINGTALK_ENABLED`、`OE_DINGTALK_WEBHOOK`、`OE_DINGTALK_SECRET`（加签）、
+  `OE_DINGTALK_MOBILES`（JSON：`{"用户名":"手机号"}`）、`OE_DINGTALK_TIMEOUT`。
+- 触发：评论落库成功后，对**被 @ 且能映射到手机号**的用户推送一条 text 消息
+  （`atMobiles` 精确 @，消息正文包含 `@手机号` 以满足钉钉自定义机器人的 @ 语义；从不 `isAtAll`）。
+- 投递在后台线程执行、失败只记日志：**钉钉不可用绝不影响评论落库与广播**。
+- 未配置 webhook 时接口状态返回 `{enabled: false, configured: false}`，评论功能照常。
+
+### 查找与替换、复制为图片（REQ-111 / REQ-114，纯前端）
+
+- 查找/替换只改本端数据，最终仍落到既有 `cell_update`（批量）操作，因此不新增协议；
+  替换前后整表进入撤销栈一次。
+- 复制选区时剪贴板同时写入三种格式：`text/plain`（TSV，粘贴到 Excel 保留行列）、
+  `text/html`（带样式的 table）与 `image/png`（区域截图）。钉钉等 IM 优先取图片，
+  因此粘贴后自动成为图片；不支持 `ClipboardItem`/图片写入的浏览器自动退化为纯文本。
+
 ## 4. WebSocket 协议
 
 连接：`/ws/sheets/{id}?token=<JWT>`
@@ -138,6 +191,8 @@ Authorization: Bearer <JWT>
 | `row_delete` / `col_delete` | `element_id`（或 `at`）,`client_id`,`version` | 按元素 ID 删除（推荐），索引作为兼容回退 |
 | `cursor` | `row`,`col` | 光标/选中位置，仅转发 |
 | `comment` | `row_id`,`col_id`,`body` | 发表评论（需 commenter 及以上），服务端广播 `comment_added` |
+| `merge` | `row_start_id`,`col_start_id`,`row_end_id`,`col_end_id`（或 `r0`,`c0`,`r1`,`c1`）,`client_id`,`version` | 合并区域（需 editor 及以上） |
+| `unmerge` | `row_id`,`col_id`（或 `row`,`col`）,`client_id`,`version` | 取消包含该格的合并区域 |
 | `ping` | - | 心跳，服务端回 `pong` |
 
 `version` 是**版本向量** `{clientId: seq}`：客户端把已见到的各客户端最大 `seq` 带上来，
@@ -147,12 +202,13 @@ Authorization: Bearer <JWT>
 
 | type | 字段 | 说明 |
 |------|------|------|
-| `welcome` | `role`,`rows`,`cols`,`rowIds`,`colIds`,`cells`,`formats`,`seq`,`version`,`users` | 加入房间时的权威快照 |
-| `welcome`（大表格） | 上述字段去掉 `rowIds`/`colIds`/`cells`/`formats`，并带 `reload: true` | 单帧体积超限时退化为元数据，客户端改用 REST 拉取 |
+| `welcome` | `role`,`rows`,`cols`,`rowIds`,`colIds`,`cells`,`formats`,`merges`,`seq`,`version`,`users` | 加入房间时的权威快照 |
+| `welcome`（大表格） | 上述字段去掉 `rowIds`/`colIds`/`cells`/`formats`/`merges`，并带 `reload: true` | 单帧体积超限时退化为元数据，客户端改用 REST 拉取 |
 | `cell_update` | `row_id`,`col_id`,`value`,`user`,`seq`,`version`,`cells`,`formats` | 广播权威投影（超大时仅 `reload: true`） |
 | `cell_format` | 同上，带 `format` | |
-| `row_insert`/`row_delete`/`col_insert`/`col_delete` | `at`,`element_id`,`rowIds`,`colIds`,`rows`,`cols`,`cells`,`formats`,`seq` | 结构变化后附带权威投影 |
-| `sheet_import` | `rows`,`cols`,`rowIds`,`colIds`,`cells`,`formats` | 整体替换通知 |
+| `row_insert`/`row_delete`/`col_insert`/`col_delete` | `at`,`element_id`,`rowIds`,`colIds`,`rows`,`cols`,`cells`,`formats`,`merges`,`seq` | 结构变化后附带权威投影 |
+| `merge` / `unmerge` | `merges`,`rowIds`,`colIds`,`rows`,`cols`,`cells`,`formats`,`seq` | 合并区域变化后附带权威投影（`merges` 已解析为下标） |
+| `sheet_import` | `rows`,`cols`,`rowIds`,`colIds`,`cells`,`formats`,`merges` | 整体替换通知 |
 | `comment_added` / `comment_updated` | `comment`,`counts`,`mentions` | 评论新增或状态变更（`counts` 为权威角标计数） |
 | `cursor` | `row`,`col`,`user` | |
 | `presence` | `user`,`online`,`users` | 在线名单（`users` 为当前在线用户数组） |
@@ -169,7 +225,8 @@ Authorization: Bearer <JWT>
   由于服务端是唯一分配 `seq` 的地方，任何到达顺序下所有副本都收敛到同一结果。
 - **行列是一等有序元素**：插删针对稳定 `element_id`，不再依赖索引，
   因此并发插入同一位置会同时保留，且不会出现坐标漂移（越界/过期坐标会被拒绝并提示）。
-- **删除即移除**：删除行/列会连同其单元格一起删除，不存在"幽灵单元"。
+- **删除即移除**：删除行/列会连同其单元格一起删除，不存在"幽灵单元"；
+  合并区域以元素 ID 锚定，区域内部插行/列自动扩展，端点被删除则区域失效。
 - **离线兜底**：WebSocket 不可用时前端自动改走 REST，写操作语义完全一致。
 - **视图（筛选/排序）不是数据变更**：条件筛选、按值多选筛选与多级排序都只作用于本端展示顺序
   （`Grid` 的 `rowOrder`），不改动单元格内容与存储顺序，因此无需协同合并；
@@ -217,3 +274,9 @@ Authorization: Bearer <JWT>
 | `OE_VERSION_SNAPSHOT_LIMIT` / `OE_VERSION_OP_LIMIT` | 20 / 5000 | 版本压缩参数 |
 | `OE_LOGIN_MAX_ATTEMPTS` | 20 | 每 IP 每分钟登录尝试上限 |
 | `OE_HSTS` | `0` | 置 `1` 时下发 HSTS 头 |
+| `OE_MAX_PREFS_CHARS` | 16384 | 单用户个性化配置 JSON 体积上限 |
+| `OE_DINGTALK_ENABLED` | `0` | 置 `1` 时启用钉钉机器人推送 |
+| `OE_DINGTALK_WEBHOOK` | 空 | 自定义机器人 webhook 地址（含 access_token） |
+| `OE_DINGTALK_SECRET` | 空 | 机器人「加签」密钥（配置后按钉钉规范签名） |
+| `OE_DINGTALK_MOBILES` | `{}` | JSON：`{"用户名":"手机号"}`，用于把 @提及 映射为 `atMobiles` |
+| `OE_DINGTALK_TIMEOUT` | 5 | 单次推送超时（秒），推送在后台线程执行 |
